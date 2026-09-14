@@ -1,0 +1,90 @@
+name: codex-suite
+
+x-image: &image
+  image: codex-suite:local
+  build: .
+
+services:
+  codex-broker:
+    <<: *image
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-3400}:3400"
+    environment:
+      CODEX_BROKER_HOST: 0.0.0.0
+      CODEX_BROKER_PORT: "3400"
+      CODEX_BROKER_DATA_DIR: /data
+      CODEX_BROKER_INTERNAL_KEY_FILE: /run/secrets/internal_key
+      CODEX_BROKER_OPENAI_COMPAT_BINDINGS_FILE: /run/secrets/compat_bindings
+      CODEX_BROKER_CONFIG_PROFILES_FILE: /app/profiles.json
+      CODEX_BROKER_ALLOWED_WORKSPACE_ROOTS: /workspaces/project
+      CODEX_BROKER_ALLOWED_BUNDLE_ROOTS: /bundles
+      CODEX_BROKER_SANDBOX_PREFLIGHT: required
+      CODEX_BROKER_MAX_ACTIVE_TURNS: "2"
+      CODEX_BROKER_MAX_POOLED_APP_SERVERS: "2"
+      CODEX_BROKER_POOL_IDLE_TTL_SECONDS: "120"
+      CODEX_BROKER_TURN_TIMEOUT_SECONDS: "1800"
+      CODEX_CREDENTIAL_STORE: file
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+      # Compose reads this local file and sends the JSON to the Linux engine.
+      - seccomp=./broker/examples/seccomp/codex-broker.json
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=1g
+    volumes:
+      - broker-data:/data
+      - type: bind
+        source: ${PROJECT_PATH:-./workspace}
+        target: /workspaces/project
+        bind:
+          create_host_path: false
+    secrets:
+      - internal_key
+      - compat_bindings
+    stop_grace_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  init:
+    <<: *image
+    profiles: [tools]
+    user: "0:0"
+    entrypoint: [python, /app/init_suite.py, /secrets]
+    network_mode: none
+    read_only: true
+    volumes:
+      - ./secrets:/secrets
+
+  client:
+    <<: *image
+    profiles: [tools]
+    entrypoint: [python, /app/client.py]
+    environment:
+      BROKER_URL: http://codex-broker:3400
+      SUITE_SECRETS: /run/secrets
+    read_only: true
+    secrets:
+      - source: internal_key
+        target: internal.key
+      - source: chat_key
+        target: chat.key
+      - source: agent_key
+        target: agent.key
+
+volumes:
+  broker-data:
+
+secrets:
+  internal_key:
+    file: ./secrets/internal.key
+  compat_bindings:
+    file: ./secrets/bindings.json
+  chat_key:
+    file: ./secrets/chat.key
+  agent_key:
+    file: ./secrets/agent.key

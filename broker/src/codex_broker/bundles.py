@@ -1,0 +1,836 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import errno
+import os
+import re
+import shutil
+import stat
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import ParseResult, urlparse
+
+from .config import BrokerConfig
+from .state import StateStore
+from .util import SECRET_KEY_PATTERN, ensure_dir, is_relative_to, json_dumps, random_id
+
+
+class BundleError(ValueError):
+    pass
+
+
+def materialized_skill_path(overlay: Path, skill: "SkillRef") -> Path:
+    """Return the native skill path exposed from one per-turn overlay."""
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", skill.name)
+    return overlay / ".agents" / "skills" / safe_name / "SKILL.md"
+
+
+@dataclass(frozen=True)
+class SkillSnapshotLimits:
+    """Bound work and storage consumed by one mounted skill snapshot."""
+
+    max_files: int = 1_024
+    max_directories: int = 1_024
+    max_depth: int = 16
+    max_total_bytes: int = 32 * 1024 * 1024
+    max_file_bytes: int = 8 * 1024 * 1024
+
+
+DEFAULT_SKILL_SNAPSHOT_LIMITS = SkillSnapshotLimits()
+
+
+@dataclass(frozen=True)
+class SkillSnapshot:
+    source_path: str
+    source_identity: str
+    sha256: str
+    file_count: int
+    total_bytes: int
+
+    def audit_payload(self, name: str) -> dict[str, Any]:
+        return {
+            "name": name,
+            "sourcePath": self.source_path,
+            "sourceIdentity": self.source_identity,
+            "snapshotSha256": self.sha256,
+            "fileCount": self.file_count,
+            "totalBytes": self.total_bytes,
+        }
+
+
+@dataclass
+class _SnapshotTraversal:
+    limits: SkillSnapshotLimits
+    digest: Any
+    file_count: int = 0
+    directory_count: int = 1
+    total_bytes: int = 0
+    saw_skill_file: bool = False
+
+
+def snapshot_skill_directory(
+    source: Path,
+    destination: Path,
+    *,
+    limits: SkillSnapshotLimits = DEFAULT_SKILL_SNAPSHOT_LIMITS,
+) -> SkillSnapshot:
+    """Securely copy and hash one mounted skill into an ephemeral overlay.
+
+    The traversal only opens entries relative to an already-open parent
+    directory descriptor. `O_NOFOLLOW` prevents symlink replacement from
+    escaping the mounted tree, and `O_NONBLOCK` ensures unsupported FIFOs never
+    stall materialization. Source bytes are copied and hashed from the same file
+    descriptor; no checked source path is reopened by pathname.
+    """
+    _require_secure_snapshot_platform()
+    _validate_snapshot_limits(limits)
+    source_fd = _open_source_directory(source)
+    try:
+        source_metadata = os.fstat(source_fd)
+        digest = hashlib.sha256(b"codex-broker-skill-snapshot-v2\\0")
+        traversal = _SnapshotTraversal(limits=limits, digest=digest)
+        try:
+            destination.mkdir(mode=0o700)
+            _snapshot_directory(source_fd, destination, (), 0, traversal, source_metadata.st_mode)
+            destination.chmod(_snapshot_directory_mode(source_metadata.st_mode))
+        except OSError as exc:
+            raise BundleError(f"Could not copy mounted skill into its per-turn snapshot: {source}") from exc
+        if not traversal.saw_skill_file:
+            raise BundleError("Mounted skill is missing SKILL.md.")
+        return SkillSnapshot(
+            source_path=str(source),
+            source_identity=f"posix:{source_metadata.st_dev}:{source_metadata.st_ino}",
+            sha256=digest.hexdigest(),
+            file_count=traversal.file_count,
+            total_bytes=traversal.total_bytes,
+        )
+    finally:
+        os.close(source_fd)
+
+
+def _require_secure_snapshot_platform() -> None:
+    required = ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK", "O_CLOEXEC")
+    if os.name != "posix" or any(not hasattr(os, flag) for flag in required):
+        raise BundleError("Mounted skill snapshots require POSIX directory-descriptor support.")
+
+
+def _validate_snapshot_limits(limits: SkillSnapshotLimits) -> None:
+    if any(
+        value <= 0
+        for value in (
+            limits.max_files,
+            limits.max_directories,
+            limits.max_depth,
+            limits.max_total_bytes,
+            limits.max_file_bytes,
+        )
+    ):
+        raise ValueError("Skill snapshot limits must all be greater than zero.")
+    if limits.max_file_bytes > limits.max_total_bytes:
+        raise ValueError("Skill snapshot max_file_bytes cannot exceed max_total_bytes.")
+
+
+def _open_source_directory(source: Path) -> int:
+    try:
+        descriptor = os.open(
+            source,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+        )
+    except OSError as exc:
+        raise BundleError(f"Mounted skill directory is unavailable: {source}") from exc
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        raise BundleError(f"Mounted skill directory is not a directory: {source}")
+    return descriptor
+
+
+def _snapshot_directory(
+    source_fd: int,
+    destination: Path,
+    parts: tuple[str, ...],
+    depth: int,
+    traversal: _SnapshotTraversal,
+    source_mode: int,
+) -> None:
+    # scandir takes ownership of a supplied descriptor, so give it a duplicate
+    # and retain the opened parent descriptor used by all child opens below.
+    with os.scandir(os.dup(source_fd)) as entries:
+        names = sorted(entry.name for entry in entries)
+    for name in names:
+        relative_parts = (*parts, name)
+        relative = "/".join(relative_parts)
+        entry_depth = depth + 1
+        if entry_depth > traversal.limits.max_depth:
+            raise BundleError(f"Mounted skill exceeds maximum snapshot depth at {relative}.")
+        entry_fd = _open_child(source_fd, name, relative)
+        try:
+            metadata = os.fstat(entry_fd)
+            if stat.S_ISDIR(metadata.st_mode):
+                traversal.directory_count += 1
+                if traversal.directory_count > traversal.limits.max_directories:
+                    raise BundleError("Mounted skill exceeds the maximum snapshot directory count.")
+                target = destination / name
+                target.mkdir(mode=0o700)
+                _update_snapshot_digest(traversal.digest, b"D", relative)
+                _snapshot_directory(entry_fd, target, relative_parts, entry_depth, traversal, metadata.st_mode)
+                target.chmod(_snapshot_directory_mode(metadata.st_mode))
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise BundleError(f"Mounted skill contains an unsupported entry: {relative}")
+            traversal.file_count += 1
+            if traversal.file_count > traversal.limits.max_files:
+                raise BundleError("Mounted skill exceeds the maximum snapshot file count.")
+            if metadata.st_size > traversal.limits.max_file_bytes:
+                raise BundleError(f"Mounted skill file exceeds the per-file snapshot byte limit: {relative}")
+            _snapshot_file(entry_fd, destination / name, relative, metadata.st_mode, traversal)
+            if relative == "SKILL.md":
+                traversal.saw_skill_file = True
+        finally:
+            os.close(entry_fd)
+    destination.chmod(_snapshot_directory_mode(source_mode))
+
+
+def _open_child(parent_fd: int, name: str, relative: str) -> int:
+    try:
+        return os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise BundleError(f"Mounted skill contains a symbolic link: {relative}") from exc
+        raise BundleError(f"Mounted skill entry is unavailable: {relative}") from exc
+
+
+def _snapshot_file(
+    source_fd: int,
+    destination: Path,
+    relative: str,
+    source_mode: int,
+    traversal: _SnapshotTraversal,
+) -> None:
+    _update_snapshot_digest(traversal.digest, b"F", relative)
+    copied = 0
+    with destination.open("xb") as target:
+        while chunk := os.read(source_fd, 1024 * 1024):
+            copied += len(chunk)
+            if copied > traversal.limits.max_file_bytes:
+                raise BundleError(f"Mounted skill file exceeds the per-file snapshot byte limit: {relative}")
+            traversal.total_bytes += len(chunk)
+            if traversal.total_bytes > traversal.limits.max_total_bytes:
+                raise BundleError("Mounted skill exceeds the total snapshot byte limit.")
+            traversal.digest.update(chunk)
+            target.write(chunk)
+    destination.chmod(_snapshot_file_mode(source_mode))
+
+
+def _update_snapshot_digest(digest: Any, kind: bytes, relative: str) -> None:
+    encoded = relative.encode("utf-8", "surrogateescape")
+    digest.update(kind)
+    digest.update(len(encoded).to_bytes(4, "big"))
+    digest.update(encoded)
+
+
+def _snapshot_file_mode(mode: int) -> int:
+    """Retain read/execute bits but never inherit source write permissions."""
+    return (stat.S_IMODE(mode) & 0o555) or 0o444
+
+
+def _snapshot_directory_mode(mode: int) -> int:
+    """Keep a snapshot traversable and removable by the broker owner.
+
+    Workspace-write may still alter this disposable copy; its directory mode is
+    not an isolation boundary. The original mounted source is never linked or
+    written, and its per-turn snapshot is deleted during turn cleanup.
+    """
+    return (stat.S_IMODE(mode) & 0o555) | 0o700
+
+
+@dataclass(frozen=True)
+class SkillRef:
+    name: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class PromptRef:
+    name: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class McpServerRef:
+    name: str
+    command: str
+    args: tuple[str, ...]
+    env: dict[str, str]
+    cwd: Path | None = None
+
+
+@dataclass(frozen=True)
+class HostedToolRef:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    endpoint: str
+    timeout_seconds: float
+    max_response_bytes: int
+    headers: dict[str, str]
+    context: dict[str, Any]
+    network_policy: dict[str, Any]
+    approval_policy: str
+    scope: str
+
+
+@dataclass(frozen=True)
+class ResolvedBundle:
+    bundle_id: str
+    version: str | None
+    instructions: tuple[str, ...]
+    skills: tuple[SkillRef, ...]
+    prompts: tuple[PromptRef, ...]
+    mcp_servers: tuple[McpServerRef, ...]
+    hosted_tools: tuple[HostedToolRef, ...]
+    allowed_paths: tuple[Path, ...]
+    sandbox_mode: str | None
+    source: str
+    path: Path
+    digest: str
+
+
+@dataclass(frozen=True)
+class MaterializedOverlay:
+    path: Path
+    skill_snapshots: tuple[SkillSnapshot, ...]
+
+
+class BundleRegistry:
+    def __init__(
+        self,
+        config: BrokerConfig,
+        state: StateStore,
+        *,
+        skill_snapshot_limits: SkillSnapshotLimits = DEFAULT_SKILL_SNAPSHOT_LIMITS,
+    ) -> None:
+        self.config = config
+        self.state = state
+        self.skill_snapshot_limits = skill_snapshot_limits
+        ensure_dir(config.inline_bundle_root)
+        ensure_dir(config.overlay_root)
+
+    def resolve(self, bundle_id: str | None) -> ResolvedBundle | None:
+        if not bundle_id:
+            return None
+        bundle_path = self._find_mounted_bundle(bundle_id)
+        source = "mount"
+        if not bundle_path:
+            record = self.state.get_bundle_record(bundle_id)
+            if record and record.get("source") == "inline":
+                path = Path(str(record.get("path") or "")).expanduser().resolve()
+                if is_relative_to(path, self.config.inline_bundle_root) and path.is_file():
+                    bundle_path = path
+                    source = "inline"
+        if not bundle_path:
+            raise BundleError(f"Unknown bundle: {bundle_id}")
+        raw = bundle_path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+        bundle = self._parse(payload, bundle_path, source, raw)
+        self.state.record_bundle(bundle.bundle_id, bundle.digest, bundle.source, str(bundle.path))
+        return bundle
+
+    def accept_inline(self, payload: dict[str, Any]) -> ResolvedBundle:
+        if not self.config.enable_inline_bundles:
+            raise BundleError("Inline bundles are disabled.")
+        raw = json_dumps(payload)
+        if len(raw.encode("utf-8")) > self.config.inline_bundle_max_bytes:
+            raise BundleError("Inline bundle exceeds size limit.")
+        digest = hashlib.sha256(json_dumps(payload).encode("utf-8")).hexdigest()
+        bundle_dir = self.config.inline_bundle_root / digest
+        bundle_path = bundle_dir / "bundle.json"
+        bundle = self._parse(payload, bundle_path, "inline", raw)
+        existing = self.state.get_bundle_record(bundle.bundle_id)
+        if self._find_mounted_bundle(bundle.bundle_id):
+            raise BundleError(f"Inline bundle id conflicts with mounted bundle: {bundle.bundle_id}")
+        if existing and (existing.get("source") != "inline" or existing.get("digest") != digest):
+            raise BundleError(f"Inline bundle id already exists with a different digest: {bundle.bundle_id}")
+        ensure_dir(bundle_dir)
+        if not bundle_path.exists():
+            bundle_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.state.record_bundle(bundle.bundle_id, bundle.digest, bundle.source, str(bundle.path))
+        return bundle
+
+    def materialize(
+        self,
+        bundle: ResolvedBundle | None,
+        turn_id: str,
+        adapter_context: dict[str, Any] | None = None,
+    ) -> Path | None:
+        materialized = self.materialize_with_provenance(bundle, turn_id, adapter_context)
+        return materialized.path if materialized else None
+
+    def materialize_with_provenance(
+        self,
+        bundle: ResolvedBundle | None,
+        turn_id: str,
+        adapter_context: dict[str, Any] | None = None,
+    ) -> MaterializedOverlay | None:
+        if bundle is None:
+            return None
+        overlay = ensure_dir(self.config.overlay_root / turn_id)
+        try:
+            ensure_dir(overlay / ".agents" / "skills")
+            skill_snapshots: list[SkillSnapshot] = []
+            for skill in bundle.skills:
+                target = materialized_skill_path(overlay, skill).parent
+                if target.exists() or target.is_symlink():
+                    if target.is_dir() and not target.is_symlink():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                skill_snapshots.append(
+                    snapshot_skill_directory(
+                        skill.path.parent,
+                        target,
+                        limits=self.skill_snapshot_limits,
+                    )
+                )
+            if bundle.prompts:
+                prompts_root = ensure_dir(overlay / "prompts")
+                for prompt in bundle.prompts:
+                    suffix = prompt.path.suffix or ".txt"
+                    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", prompt.name)
+                    target = prompts_root / f"{safe_name}{suffix}"
+                    if target.exists() or target.is_symlink():
+                        if target.is_dir() and not target.is_symlink():
+                            shutil.rmtree(target)
+                        else:
+                            target.unlink()
+                    target.symlink_to(prompt.path)
+            if bundle.instructions:
+                (overlay / "AGENTS.md").write_text("\n\n".join(bundle.instructions), encoding="utf-8")
+            if bundle.hosted_tools:
+                adapter_config = {
+                    "tools": [
+                        {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "inputSchema": tool.input_schema,
+                            "endpoint": tool.endpoint,
+                            "timeoutSeconds": tool.timeout_seconds,
+                            "maxResponseBytes": tool.max_response_bytes,
+                            "headers": tool.headers,
+                            "context": tool.context,
+                            "networkPolicy": tool.network_policy,
+                            "approvalPolicy": tool.approval_policy,
+                            "scope": tool.scope,
+                        }
+                        for tool in bundle.hosted_tools
+                    ],
+                    "brokerContext": adapter_context or {},
+                }
+                (overlay / "tool-adapters.json").write_text(
+                    json.dumps(adapter_config, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            mcp_servers = self.mcp_servers_for_bundle(bundle, overlay)
+            if mcp_servers:
+                codex_dir = ensure_dir(overlay / ".codex")
+                (codex_dir / "config.toml").write_text(self._mcp_config_toml(mcp_servers), encoding="utf-8")
+            return MaterializedOverlay(overlay, tuple(skill_snapshots))
+        except Exception:
+            self.cleanup_overlay(turn_id)
+            raise
+
+    def mcp_servers_for_bundle(self, bundle: ResolvedBundle, overlay: Path | None = None) -> tuple[McpServerRef, ...]:
+        servers = list(bundle.mcp_servers)
+        if bundle.hosted_tools:
+            if overlay is None:
+                overlay = ensure_dir(self.config.overlay_root / f"adapter-{bundle.digest[:16]}-{random_id('tmp')}")
+            config_path = overlay / "tool-adapters.json"
+            secret_env = {
+                value.removeprefix("env:"): value
+                for tool in bundle.hosted_tools
+                for value in tool.headers.values()
+                if value.startswith("env:")
+            }
+            servers.append(
+                McpServerRef(
+                    name=f"broker_hosted_{bundle.digest[:12]}",
+                    command=sys.executable,
+                    args=("-m", "codex_broker.tool_adapter_mcp", str(config_path)),
+                    env=secret_env,
+                    cwd=None,
+                )
+            )
+        return tuple(servers)
+
+    def cleanup_overlay(self, turn_id: str) -> None:
+        path = self.config.overlay_root / turn_id
+        if path.exists():
+            shutil.rmtree(path)
+
+    def validate_cwd(self, cwd: str | None, bundle: ResolvedBundle | None = None) -> Path | None:
+        if not cwd:
+            return None
+        path = Path(cwd).expanduser().resolve()
+        allowed = [*self.config.allowed_workspace_roots]
+        if bundle:
+            allowed.extend(bundle.allowed_paths)
+        if not any(is_relative_to(path, root) for root in allowed):
+            raise BundleError(f"cwd is outside allowed workspace roots: {path}")
+        return path
+
+    def _find_mounted_bundle(self, bundle_id: str) -> Path | None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", bundle_id):
+            raise BundleError(f"Invalid bundle id: {bundle_id!r}")
+        candidates: list[tuple[Path, Path]] = []
+        for root in self.config.allowed_bundle_roots:
+            root = root.resolve()
+            candidates.extend(
+                [
+                    (root, root / bundle_id / "bundle.json"),
+                    (root, root / f"{bundle_id}.json"),
+                    (root, root / bundle_id),
+                ]
+            )
+        for root, candidate in candidates:
+            resolved = candidate.resolve()
+            if not is_relative_to(resolved, root) or not resolved.is_file():
+                continue
+            try:
+                payload = json.loads(resolved.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise BundleError(f"Invalid bundle manifest: {resolved}") from exc
+            if not isinstance(payload, dict) or payload.get("id") != bundle_id:
+                raise BundleError(f"Bundle manifest id does not match requested id: {bundle_id}")
+            return resolved
+        for root in self.config.allowed_bundle_roots:
+            root = root.resolve()
+            if not root.exists():
+                continue
+            for path in root.rglob("bundle.json"):
+                resolved = path.resolve()
+                if not is_relative_to(resolved, root):
+                    continue
+                try:
+                    payload = json.loads(resolved.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict) and payload.get("id") == bundle_id:
+                    return resolved
+        return None
+
+    def _parse(self, payload: dict[str, Any], path: Path, source: str, raw: str) -> ResolvedBundle:
+        if not isinstance(payload, dict):
+            raise BundleError("Bundle manifest must be a JSON object.")
+        bundle_id = str(payload.get("id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", bundle_id):
+            raise BundleError("Bundle id must be 1-128 letters, numbers, dots, underscores, or hyphens.")
+        instructions_raw = self._array(payload, "instructions")
+        if any(not isinstance(item, str) for item in instructions_raw):
+            raise BundleError("Bundle instructions must be strings.")
+        instructions = tuple(instructions_raw)
+        allowed_paths = tuple(self._validated_workspace_path(value) for value in self._array(payload, "allowedPaths"))
+        skills: list[SkillRef] = []
+        for entry in self._array(payload, "skills"):
+            if not isinstance(entry, dict):
+                raise BundleError("Skill entries must be objects.")
+            name = str(entry.get("name") or "").strip()
+            source_info = entry.get("source") if isinstance(entry.get("source"), dict) else {}
+            if source_info.get("type") != "mount":
+                raise BundleError("Only mounted skill sources are supported in v1.")
+            skill_path = Path(str(source_info.get("path") or "")).expanduser().resolve()
+            if not any(is_relative_to(skill_path, root) for root in self.config.allowed_bundle_roots):
+                raise BundleError(f"Skill path is outside allowed bundle roots: {skill_path}")
+            skill_md = skill_path / "SKILL.md" if skill_path.is_dir() else skill_path
+            resolved_skill_md = skill_md.resolve()
+            if not any(is_relative_to(resolved_skill_md, root) for root in self.config.allowed_bundle_roots):
+                raise BundleError(f"Skill SKILL.md is outside allowed bundle roots: {resolved_skill_md}")
+            if not resolved_skill_md.is_file():
+                raise BundleError(f"Skill SKILL.md not found: {skill_md}")
+            skills.append(SkillRef(name=name or resolved_skill_md.parent.name, path=resolved_skill_md))
+        prompts: list[PromptRef] = []
+        for entry in self._array(payload, "prompts"):
+            if not isinstance(entry, dict):
+                raise BundleError("Prompt entries must be objects.")
+            name = str(entry.get("name") or "").strip()
+            source_info = entry.get("source") if isinstance(entry.get("source"), dict) else entry
+            if source_info.get("type", "mount") != "mount":
+                raise BundleError("Only mounted prompt sources are supported in v1.")
+            prompt_path = Path(str(source_info.get("path") or "")).expanduser().resolve()
+            if not any(is_relative_to(prompt_path, root) for root in self.config.allowed_bundle_roots):
+                raise BundleError(f"Prompt path is outside allowed bundle roots: {prompt_path}")
+            if not prompt_path.is_file():
+                raise BundleError(f"Prompt file not found: {prompt_path}")
+            prompts.append(PromptRef(name=name or prompt_path.stem, path=prompt_path))
+        mcp_servers = tuple(self._parse_mcp_server(entry) for entry in self._array(payload, "mcpServers"))
+        hosted_tools = tuple(self._parse_hosted_tool(entry) for entry in self._array(payload, "tools"))
+        self._unique_names("skill", (item.name for item in skills))
+        self._unique_names("prompt", (item.name for item in prompts))
+        self._unique_names("MCP server", (item.name for item in mcp_servers))
+        self._unique_names("hosted tool", (item.name for item in hosted_tools))
+        sandbox = payload.get("sandbox") if isinstance(payload.get("sandbox"), dict) else {}
+        digest = hashlib.sha256(json_dumps(payload).encode("utf-8")).hexdigest()
+        return ResolvedBundle(
+            bundle_id=bundle_id,
+            version=str(payload.get("version")) if payload.get("version") is not None else None,
+            instructions=instructions,
+            skills=tuple(skills),
+            prompts=tuple(prompts),
+            mcp_servers=mcp_servers,
+            hosted_tools=hosted_tools,
+            allowed_paths=allowed_paths,
+            sandbox_mode=str(sandbox.get("mode")) if sandbox.get("mode") else None,
+            source=source,
+            path=path,
+            digest=digest,
+        )
+
+    def _validated_workspace_path(self, value: str) -> Path:
+        path = Path(str(value)).expanduser().resolve()
+        if not any(is_relative_to(path, root) for root in self.config.allowed_workspace_roots):
+            raise BundleError(f"Bundle allowed path is outside broker allowlist: {path}")
+        return path
+
+    def _parse_mcp_server(self, entry: Any) -> McpServerRef:
+        if not isinstance(entry, dict):
+            raise BundleError("MCP server entries must be objects.")
+        name = str(entry.get("name") or "").strip()
+        command = str(entry.get("command") or "").strip()
+        if not name or not command:
+            raise BundleError("MCP server name and command are required.")
+        self._validate_command(command)
+        args = tuple(str(arg) for arg in entry.get("args") or [])
+        env = self._parse_mcp_env(entry.get("env") if isinstance(entry.get("env"), dict) else {})
+        cwd_value = entry.get("cwd")
+        cwd = Path(str(cwd_value)).expanduser().resolve() if cwd_value else None
+        if cwd and not any(is_relative_to(cwd, root) for root in (*self.config.allowed_bundle_roots, *self.config.allowed_workspace_roots)):
+            raise BundleError(f"MCP cwd is outside allowed roots: {cwd}")
+        return McpServerRef(name=name, command=command, args=args, env=env, cwd=cwd)
+
+    def _parse_mcp_env(self, env: dict[str, Any]) -> dict[str, str]:
+        parsed: dict[str, str] = {}
+        for key, value in env.items():
+            name = str(key)
+            text = str(value)
+            if not name or any(char in name for char in "\r\n="):
+                raise BundleError(f"Invalid MCP env name: {name!r}")
+            if any(char in text for char in "\r\n"):
+                raise BundleError(f"Invalid MCP env value for {name}.")
+            if SECRET_KEY_PATTERN.search(name) and not text.startswith("env:"):
+                raise BundleError(f"MCP secret env {name} must use env:VAR indirection.")
+            if text.startswith("env:"):
+                env_name = text.removeprefix("env:")
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
+                    raise BundleError(f"Invalid MCP env indirection for {name}.")
+            parsed[name] = text
+        return parsed
+
+    def _parse_hosted_tool(self, entry: Any) -> HostedToolRef:
+        if not isinstance(entry, dict):
+            raise BundleError("Tool entries must be objects.")
+        tool_type = str(entry.get("type") or entry.get("adapter") or "broker-hosted")
+        if tool_type not in {"broker-hosted", "host-http"}:
+            raise BundleError(f"Unsupported tool adapter type: {tool_type}")
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            raise BundleError("Hosted tool name is required.")
+        http = entry.get("http") if isinstance(entry.get("http"), dict) else entry
+        endpoint = str(http.get("url") or http.get("endpoint") or "").strip()
+        if not endpoint.startswith(("http://", "https://")):
+            raise BundleError("Hosted tool endpoint must be http:// or https://.")
+        matched_network_prefix = self._validate_hosted_tool_endpoint(endpoint)
+        input_schema = entry.get("inputSchema") if isinstance(entry.get("inputSchema"), dict) else {"type": "object"}
+        headers_raw = http.get("headers") if isinstance(http.get("headers"), dict) else entry.get("headers")
+        headers = self._parse_headers(headers_raw if isinstance(headers_raw, dict) else {})
+        context = entry.get("context") if isinstance(entry.get("context"), dict) else {}
+        policy = entry.get("policy") if isinstance(entry.get("policy"), dict) else {}
+        network_policy = self._parse_hosted_network_policy(entry, policy, matched_network_prefix)
+        approval_policy = str(policy.get("approval") or entry.get("approval") or entry.get("approvalPolicy") or "never")
+        if approval_policy not in {"never", "on-request", "always"}:
+            raise BundleError(f"Unsupported hosted tool approval policy: {approval_policy}")
+        scope = str(policy.get("scope") or entry.get("scope") or "owner")
+        if scope not in {"owner", "profile"}:
+            raise BundleError(f"Unsupported hosted tool scope: {scope}")
+        timeout_seconds = self._positive_float(
+            http.get("timeoutSeconds", entry.get("timeoutSeconds", 30)),
+            "Hosted tool timeoutSeconds",
+        )
+        return HostedToolRef(
+            name=name,
+            description=str(entry.get("description") or ""),
+            input_schema=input_schema,
+            endpoint=endpoint,
+            timeout_seconds=timeout_seconds,
+            headers=headers,
+            context=dict(context),
+            network_policy=network_policy,
+            approval_policy=approval_policy,
+            scope=scope,
+            max_response_bytes=self._positive_int(
+                http.get("maxResponseBytes", entry.get("maxResponseBytes", self.config.hosted_tool_max_response_bytes)),
+                "Hosted tool maxResponseBytes",
+            ),
+        )
+
+    def _parse_headers(self, headers: dict[str, Any]) -> dict[str, str]:
+        parsed: dict[str, str] = {}
+        for key, value in headers.items():
+            name = str(key)
+            text = str(value)
+            if not name or any(char in name for char in "\r\n:"):
+                raise BundleError(f"Invalid hosted tool header name: {name!r}")
+            if any(char in text for char in "\r\n"):
+                raise BundleError(f"Invalid hosted tool header value for {name}.")
+            if SECRET_KEY_PATTERN.search(name) and not text.startswith("env:"):
+                raise BundleError(f"Hosted tool secret header {name} must use env:VAR indirection.")
+            if text.startswith("env:"):
+                env_name = text.removeprefix("env:")
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
+                    raise BundleError(f"Invalid hosted tool header environment variable for {name}.")
+            parsed[name] = text
+        return parsed
+
+    def _parse_hosted_network_policy(self, entry: dict[str, Any], policy: dict[str, Any], matched_prefix: str | None) -> dict[str, Any]:
+        raw = entry.get("networkPolicy", policy.get("networkPolicy", policy.get("network")))
+        if raw is None:
+            mode = "host-allowlist"
+        elif isinstance(raw, str):
+            mode = raw
+        elif isinstance(raw, dict):
+            mode = str(raw.get("mode") or raw.get("type") or "host-allowlist")
+        else:
+            raise BundleError("Hosted tool network policy must be a string or object.")
+        if mode != "host-allowlist":
+            raise BundleError(f"Unsupported hosted tool network policy: {mode}")
+        result: dict[str, Any] = {"mode": "host-allowlist"}
+        if matched_prefix:
+            result["matchedPrefix"] = matched_prefix
+        return result
+
+    def _validate_hosted_tool_endpoint(self, endpoint: str) -> str | None:
+        prefixes = self.config.allowed_hosted_tool_url_prefixes
+        if not prefixes:
+            raise BundleError("Hosted tools are disabled because no endpoint allowlist is configured.")
+        for prefix in prefixes:
+            if self._hosted_tool_url_matches(endpoint, prefix):
+                return prefix
+        raise BundleError(f"Hosted tool endpoint is outside network allowlist: {endpoint}")
+
+    @staticmethod
+    def _array(payload: dict[str, Any], key: str) -> list[Any]:
+        value = payload.get(key)
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise BundleError(f"Bundle {key} must be an array.")
+        return value
+
+    @staticmethod
+    def _unique_names(kind: str, names: Any) -> None:
+        seen: set[str] = set()
+        for name in names:
+            if not name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name):
+                raise BundleError(f"Invalid {kind} name: {name!r}")
+            if name in seen:
+                raise BundleError(f"Duplicate {kind} name: {name}")
+            seen.add(name)
+
+    @staticmethod
+    def _positive_int(value: Any, label: str) -> int:
+        if isinstance(value, bool):
+            raise BundleError(f"{label} must be a positive integer.")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise BundleError(f"{label} must be a positive integer.") from exc
+        if parsed <= 0:
+            raise BundleError(f"{label} must be a positive integer.")
+        return parsed
+
+    @staticmethod
+    def _positive_float(value: Any, label: str) -> float:
+        if isinstance(value, bool):
+            raise BundleError(f"{label} must be a positive finite number.")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise BundleError(f"{label} must be a positive finite number.") from exc
+        if not math.isfinite(parsed) or parsed <= 0:
+            raise BundleError(f"{label} must be a positive finite number.")
+        return parsed
+
+    def _hosted_tool_url_matches(self, endpoint: str, prefix: str) -> bool:
+        target = urlparse(endpoint)
+        allowed = urlparse(prefix)
+        if target.scheme not in {"http", "https"} or allowed.scheme not in {"http", "https"}:
+            return False
+        if not target.hostname or not allowed.hostname:
+            return False
+        if target.scheme != allowed.scheme:
+            return False
+        if target.hostname.lower() != allowed.hostname.lower():
+            return False
+        allowed_port = self._url_port(allowed)
+        if allowed_port is not None:
+            target_port = self._url_port(target) or (443 if target.scheme == "https" else 80)
+            if target_port != allowed_port:
+                return False
+        allowed_path = allowed.path.rstrip("/")
+        if allowed_path:
+            target_path = target.path or "/"
+            if target_path != allowed_path and not target_path.startswith(f"{allowed_path}/"):
+                return False
+        return True
+
+    @staticmethod
+    def _url_port(parsed: ParseResult) -> int | None:
+        try:
+            return parsed.port
+        except ValueError:
+            return None
+
+    def _validate_command(self, command: str) -> None:
+        allowed_names: set[str] = set()
+        allowed_paths: set[Path] = set()
+        for value in self.config.allowed_tool_commands:
+            allowed = str(value).strip()
+            if not allowed:
+                continue
+            allowed_path = Path(allowed).expanduser()
+            if allowed_path.is_absolute():
+                allowed_paths.add(allowed_path.resolve())
+            else:
+                allowed_names.add(allowed)
+        command_path = Path(command).expanduser()
+        if command_path.is_absolute():
+            resolved = command_path.resolve()
+            if resolved in allowed_paths:
+                return
+            raise BundleError(f"MCP command path is not allowlisted: {resolved}")
+        if command in allowed_names:
+            return
+        raise BundleError(f"MCP command is not allowlisted: {command}")
+
+    def _mcp_config_toml(self, servers: tuple[McpServerRef, ...]) -> str:
+        lines: list[str] = []
+        for server in servers:
+            table_name = server.name.replace('"', "")
+            lines.append(f'[mcp_servers."{table_name}"]')
+            lines.append(f"command = {json.dumps(server.command)}")
+            if server.args:
+                lines.append(f"args = {json.dumps(list(server.args))}")
+            if server.cwd:
+                lines.append(f"cwd = {json.dumps(str(server.cwd))}")
+            config_env = {key: value for key, value in server.env.items() if not value.startswith("env:")}
+            if config_env:
+                env_items = ", ".join(f"{json.dumps(key)} = {json.dumps(value)}" for key, value in config_env.items())
+                lines.append(f"env = {{ {env_items} }}")
+            lines.append("")
+        return "\n".join(lines)

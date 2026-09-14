@@ -1,0 +1,16 @@
+{
+  "default": {
+    "sandbox": "read-only",
+    "approvalPolicy": "never",
+    "approvalsReviewer": "user",
+    "enabledBundles": [],
+    "allowedWorkspaceRoots": ["/workspaces/project"]
+  },
+  "agent": {
+    "sandbox": "workspace-write",
+    "approvalPolicy": "never",
+    "approvalsReviewer": "user",
+    "enabledBundles": [],
+    "allowedWorkspaceRoots": ["/workspaces/project"]
+  }
+}

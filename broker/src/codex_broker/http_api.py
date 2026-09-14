@@ -1,0 +1,1011 @@
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import shutil
+import time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
+
+from . import __version__, account_api, auth_api, openai_api
+from .app_server import AppServerError
+from .bundles import BundleError
+from .config import BrokerConfig
+from .events import public_broker_event
+from .identity import AuthPrincipalPolicyError
+from .scheduler import ActiveTurnError, ConflictError, NotFoundError, TurnScheduler
+from .services import BrokerServices, serve
+from .util import ensure_dir, json_dumps, json_log
+
+
+def metric_path_template(path: str) -> str:
+    if path in {"/healthz", "/readyz", "/metrics", "/openapi.json"}:
+        return path.strip("/") or "root"
+    segments = [part for part in path.strip("/").split("/") if part]
+    if segments[:2] == ["v1", "models"]:
+        return "v1/models/model" if len(segments) > 2 else "v1/models"
+    if segments[:2] == ["v1", "responses"]:
+        if len(segments) == 2:
+            return "v1/responses"
+        if len(segments) == 3:
+            return "v1/responses/responseId"
+        suffix = segments[3] if segments[3] in {"input_items", "cancel"} else "resource"
+        return f"v1/responses/responseId/{suffix}"
+    if segments == ["v1", "chat", "completions"]:
+        return "v1/chat/completions"
+    if segments[:2] == ["v1", "bundles"]:
+        return "/".join(segments)
+    if len(segments) >= 4 and segments[:2] == ["v1", "owners"]:
+        templated = ["v1", "owners", "ownerId", *segments[3:]]
+        if len(templated) >= 5 and templated[3] == "threads":
+            templated[4] = "threadId"
+        if len(templated) >= 7 and templated[5] == "turns":
+            templated[6] = "turnId"
+        if len(templated) >= 9 and templated[7] == "interactions":
+            templated[8] = "interactionId"
+        return "/".join(templated)
+    return "unknown"
+
+
+def is_unauthenticated_path(method: str, path: str) -> bool:
+    return method == "GET" and path in {"/healthz", "/readyz"}
+
+
+class BrokerHandler(BaseHTTPRequestHandler):
+    broker: BrokerServices
+    server_version = f"CodexBroker/{__version__}"
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib handler API.
+        self._dispatch("GET")
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler API.
+        self._dispatch("POST")
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def _dispatch(self, method: str) -> None:
+        started_at = time.monotonic()
+        self._metric_status = HTTPStatus.INTERNAL_SERVER_ERROR
+        metric_endpoint = metric_path_template(urlparse(self.path).path)
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            if method == "GET" and path == "/healthz":
+                self._json({"status": "ok"})
+                return
+            if method == "GET" and path == "/readyz":
+                self._readyz()
+                return
+            if openai_api.handle_openai_route(self, method, path, query):
+                return
+            if not is_unauthenticated_path(method, path) and not self._authorized():
+                self._json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                return
+            if method == "GET" and path == "/metrics":
+                self._metrics()
+                return
+            if method == "GET" and path == "/openapi.json":
+                self._json(openapi_document())
+                return
+            segments = [unquote(part) for part in path.strip("/").split("/") if part]
+            if segments[:2] == ["v1", "bundles"] and method == "POST" and len(segments) == 3 and segments[2] == "inline":
+                bundle = self.broker.bundles.accept_inline(self._read_json())
+                self._json({"bundleId": bundle.bundle_id, "digest": bundle.digest, "source": bundle.source}, HTTPStatus.CREATED)
+                return
+            if len(segments) >= 4 and segments[:2] == ["v1", "owners"]:
+                owner_id = segments[2]
+                self._owner_route(method, segments[3:], owner_id, query)
+                return
+            self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+        except ActiveTurnError as exc:
+            self._json({"error": str(exc) or "active_turn_exists"}, HTTPStatus.CONFLICT)
+        except ConflictError as exc:
+            self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
+        except NotFoundError as exc:
+            self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+        except AuthPrincipalPolicyError as exc:
+            self._json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
+        except (ValueError, BundleError) as exc:
+            self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except AppServerError as exc:
+            self._json({"error": str(exc)}, HTTPStatus.BAD_GATEWAY)
+        except Exception as exc:  # noqa: BLE001 - HTTP boundary must return JSON errors.
+            self._json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        finally:
+            elapsed = time.monotonic() - started_at
+            status = int(getattr(self, "_metric_status", HTTPStatus.INTERNAL_SERVER_ERROR))
+            self.broker.scheduler.note_http_request(metric_endpoint, status, elapsed)
+            json_log(
+                self.broker.config.json_logs,
+                "http.request",
+                sanitizer=self.broker.sanitizer,
+                method=method,
+                endpoint=metric_endpoint,
+                status=status,
+                durationMs=round(elapsed * 1000, 3),
+                **self._log_context_for_path(urlparse(self.path).path),
+            )
+
+    def _owner_route(self, method: str, tail: list[str], owner_id: str, query: dict[str, list[str]]) -> None:
+        if tail[:1] == ["auth"]:
+            self._auth_route(method, tail[1:], owner_id, query)
+            return
+        if tail == ["audit-logs"]:
+            self._audit_route(method, owner_id, query)
+            return
+        if tail[:1] == ["threads"]:
+            self._thread_route(method, tail[1:], owner_id, query)
+            return
+        self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+
+    def _audit_route(self, method: str, owner_id: str, query: dict[str, list[str]]) -> None:
+        if method != "GET":
+            self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+            return
+        owner_hash = self.broker.auth.hash_owner(owner_id)
+        limit = int(query.get("limit", ["100"])[0] or "100")
+        logs = self.broker.state.list_audit_logs(
+            owner_hash,
+            action=query.get("action", [None])[0],
+            profile=query.get("profile", [None])[0],
+            thread_id=query.get("threadId", [None])[0],
+            turn_id=query.get("turnId", [None])[0],
+            after=int(query.get("after", ["0"])[0] or "0"),
+            limit=limit,
+        )
+        self._json({"ownerHash": owner_hash, "auditLogs": [self._public_audit(entry) for entry in logs]})
+
+    def _auth_route(self, method: str, tail: list[str], owner_id: str, query: dict[str, list[str]]) -> None:
+        if account_api.handle_account_route(self, method, tail, owner_id, query):
+            return
+        if auth_api.handle_auth_route(self, method, tail, owner_id, query):
+            return
+        self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+
+    def _thread_route(self, method: str, tail: list[str], owner_id: str, query: dict[str, list[str]]) -> None:
+        if method == "POST" and tail == []:
+            self._json(self.broker.scheduler.create_thread(owner_id, self._read_json(allow_empty=True)), HTTPStatus.CREATED)
+            return
+        if len(tail) < 1:
+            self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+            return
+        thread_id = tail[0]
+        if method == "GET" and len(tail) == 1:
+            self._json(self.broker.scheduler.get_thread(owner_id, thread_id))
+            return
+        if method == "POST" and tail[1:] == ["archive"]:
+            self._json(self.broker.scheduler.archive_thread(owner_id, thread_id))
+            return
+        if method == "GET" and tail[1:] == ["events"]:
+            self._sse_events(owner_id, thread_id, query)
+            return
+        if method == "GET" and tail[1:] == ["interactions"]:
+            status = query.get("status", [None])[0]
+            turn_id_filter = query.get("turnId", [None])[0]
+            limit = int(query.get("limit", ["100"])[0] or "100")
+            self._json(self.broker.scheduler.list_interactions(owner_id, thread_id, turn_id=turn_id_filter, status=status, limit=limit))
+            return
+        if len(tail) >= 2 and tail[1] == "turns":
+            self._turn_route(method, tail[2:], owner_id, thread_id, query)
+            return
+        self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+
+    def _turn_route(self, method: str, tail: list[str], owner_id: str, thread_id: str, query: dict[str, list[str]]) -> None:
+        if method == "POST" and tail == []:
+            self._json(
+                self.broker.scheduler.start_turn(
+                    owner_id,
+                    thread_id,
+                    self._read_json(),
+                    danger_full_access_authorized=self._danger_full_access_authorized(),
+                ),
+                HTTPStatus.ACCEPTED,
+            )
+            return
+        if len(tail) < 1:
+            self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+            return
+        turn_id = tail[0]
+        if method == "GET" and len(tail) == 1:
+            self._json(self.broker.scheduler.get_turn(owner_id, thread_id, turn_id))
+            return
+        if method == "POST" and tail[1:] == ["steer"]:
+            self._json(self.broker.scheduler.steer_turn(owner_id, thread_id, turn_id, self._read_json()))
+            return
+        if method == "POST" and tail[1:] == ["interrupt"]:
+            self._json(self.broker.scheduler.interrupt_turn(owner_id, thread_id, turn_id))
+            return
+        if len(tail) >= 2 and tail[1] == "interactions":
+            self._interaction_route(method, tail[2:], owner_id, thread_id, turn_id, query)
+            return
+        self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+
+    def _interaction_route(
+        self,
+        method: str,
+        tail: list[str],
+        owner_id: str,
+        thread_id: str,
+        turn_id: str,
+        query: dict[str, list[str]],
+    ) -> None:
+        if method == "GET" and tail == []:
+            status = query.get("status", [None])[0]
+            limit = int(query.get("limit", ["100"])[0] or "100")
+            self._json(self.broker.scheduler.list_interactions(owner_id, thread_id, turn_id=turn_id, status=status, limit=limit))
+            return
+        if len(tail) != 1 and tail[1:] != ["resolve"]:
+            self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+            return
+        interaction_id = tail[0]
+        if method == "GET" and len(tail) == 1:
+            self._json(self.broker.scheduler.get_interaction(owner_id, thread_id, turn_id, interaction_id))
+            return
+        if method == "POST" and tail[1:] == ["resolve"]:
+            self._json(self.broker.scheduler.resolve_interaction(owner_id, thread_id, turn_id, interaction_id, self._read_json()))
+            return
+        self._json({"error": "not_found"}, HTTPStatus.NOT_FOUND)
+
+    def _public_audit(self, entry: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": entry["id"],
+            "ownerHash": entry["owner_hash"],
+            "authPrincipalHash": entry.get("auth_principal_hash"),
+            "profile": entry.get("profile"),
+            "threadId": entry.get("thread_id"),
+            "turnId": entry.get("turn_id"),
+            "action": entry["action"],
+            "payload": entry["payload"],
+            "createdAt": entry["created_at"],
+        }
+
+    def _sse_events(self, owner_id: str, thread_id: str, query: dict[str, list[str]]) -> None:
+        owner_hash = self.broker.auth.hash_owner(owner_id)
+        after = int(query.get("after", ["0"])[0] or "0")
+        turn_id = query.get("turnId", [None])[0]
+        if not self.broker.state.get_thread(owner_hash, thread_id):
+            raise NotFoundError("Thread not found.")
+        if turn_id and not self.broker.state.get_turn(owner_hash, thread_id, turn_id):
+            raise NotFoundError("Turn not found.")
+        self._metric_status = HTTPStatus.OK
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        last_heartbeat = time.monotonic()
+        while True:
+            events = self.broker.state.list_events(owner_hash, thread_id, after=after, turn_id=turn_id, limit=100)
+            for event in events:
+                after = int(event["id"])
+                public_event_type, public_event_payload = public_broker_event(
+                    str(event["event_type"]),
+                    event["payload"],
+                )
+                payload = {
+                    "id": event["id"],
+                    "type": public_event_type,
+                    "ownerHash": owner_hash,
+                    "threadId": thread_id,
+                    "turnId": event.get("turn_id"),
+                    "productCorrelationId": event.get("product_correlation_id"),
+                    "codexThreadId": event.get("codex_thread_id"),
+                    "codexTurnId": event.get("codex_turn_id"),
+                    "createdAt": event["created_at"],
+                    "payload": public_event_payload,
+                    "ambiguous": event["ambiguous"],
+                }
+                if event.get("raw_method"):
+                    payload["rawMethod"] = event["raw_method"]
+                    payload["rawParams"] = event.get("raw_params")
+                if not self._write_sse(public_event_type, payload, event_id=after):
+                    self.broker.scheduler.note_event_stream_disconnect()
+                    return
+            now = time.monotonic()
+            if now - last_heartbeat > 10:
+                if not self._write_raw(": heartbeat\n\n"):
+                    self.broker.scheduler.note_event_stream_disconnect()
+                    return
+                last_heartbeat = now
+            self.broker.state.wait_for_events(min(max(10 - (now - last_heartbeat), 0.05), 1.0))
+
+    def _readyz(self) -> None:
+        errors: list[str] = []
+        if not self.broker.state.ping():
+            errors.append("state store unavailable")
+        if not self.broker.config.internal_key and not self.broker.config.allow_unauthenticated:
+            errors.append("internal API key not configured")
+        command = self.broker.config.codex_command[0]
+        if not shutil.which(command) and not Path(command).exists():
+            errors.append(f"Codex binary not found: {command}")
+        for root in self.broker.config.allowed_workspace_roots:
+            if not self._readable_dir(root):
+                errors.append(f"workspace root unreadable: {root}")
+        for root in self.broker.config.allowed_bundle_roots:
+            if not self._readable_dir(root):
+                errors.append(f"bundle root unreadable: {root}")
+        try:
+            ensure_dir(self.broker.config.auth_root)
+            probe = self.broker.config.auth_root / ".write-probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+        except OSError as exc:
+            errors.append(f"auth root not writable: {exc}")
+        sandbox_result = self.broker.sandbox_probe.result() or self.broker.sandbox_probe.run_once()
+        if (
+            self.broker.config.sandbox_preflight_mode == "required"
+            and sandbox_result.status != "healthy"
+        ):
+            errors.append("The command sandbox could not start.")
+        status = HTTPStatus.OK if not errors else HTTPStatus.SERVICE_UNAVAILABLE
+        self._json(
+            {
+                "status": "ready" if not errors else "not_ready",
+                "errors": errors,
+                "sandboxPreflight": sandbox_result.public(),
+            },
+            status,
+        )
+
+    @staticmethod
+    def _readable_dir(path: Path) -> bool:
+        return path.exists() and path.is_dir() and os.access(path, os.R_OK | os.X_OK)
+
+    def _metrics(self) -> None:
+        metrics = self.broker.scheduler.metrics()
+        body = "\n".join(f"codex_broker_{key} {value}" for key, value in sorted(metrics.items())) + "\n"
+        self._metric_status = HTTPStatus.OK
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/plain; version=0.0.4")
+        self.send_header("Content-Length", str(len(body.encode("utf-8"))))
+        self.end_headers()
+        self.wfile.write(body.encode("utf-8"))
+
+    def _authorized(self) -> bool:
+        key = self.broker.config.internal_key
+        if not key:
+            return self.broker.config.allow_unauthenticated
+        auth = self.headers.get("Authorization", "")
+        if auth == f"Bearer {key}":
+            return True
+        return self.headers.get("X-Codex-Broker-Key") == key
+
+    def _danger_full_access_authorized(self) -> bool:
+        expected = self.broker.config.danger_full_access_key
+        supplied = self.headers.get("X-Codex-Broker-Danger-Full-Access-Key")
+        return bool(expected and supplied and secrets.compare_digest(supplied, expected))
+
+    def _read_json(self, *, allow_empty: bool = False) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length") or "0")
+        if length <= 0:
+            return {} if allow_empty else (_ for _ in ()).throw(ValueError("JSON request body is required."))
+        input_route = metric_path_template(urlparse(self.path).path) in {
+            "v1/responses",
+            "v1/chat/completions",
+            "v1/owners/ownerId/threads/threadId/turns",
+            "v1/owners/ownerId/threads/threadId/turns/turnId/steer",
+        }
+        max_bytes = 32 * 1024 * 1024 if input_route else 1_000_000
+        if length > max_bytes:
+            self.close_connection = True
+            raise ValueError("JSON request body is too large.")
+        data = self.rfile.read(length)
+        parsed = json.loads(data.decode("utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("JSON request body must be an object.")
+        return parsed
+
+    def _json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+        body = json_dumps(payload).encode("utf-8")
+        self._metric_status = status
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _write_sse(self, event: str, payload: dict[str, Any], *, event_id: int) -> bool:
+        body = f"id: {event_id}\nevent: {event}\ndata: {json_dumps(payload)}\n\n"
+        return self._write_raw(body)
+
+    def _write_raw(self, body: str) -> bool:
+        try:
+            payload = body.encode("utf-8")
+            chunk = f"{len(payload):X}\r\n".encode("ascii") + payload + b"\r\n"
+            self.wfile.write(chunk)
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return False
+
+    def _log_context_for_path(self, path: str) -> dict[str, Any]:
+        segments = [unquote(part) for part in path.strip("/").split("/") if part]
+        context: dict[str, Any] = {}
+        if len(segments) >= 3 and segments[:2] == ["v1", "owners"]:
+            context["ownerHash"] = self.broker.auth.hash_owner(segments[2])
+        if len(segments) >= 5 and segments[3] == "threads":
+            context["threadId"] = segments[4]
+        if len(segments) >= 7 and segments[5] == "turns":
+            context["turnId"] = segments[6]
+        return context
+
+
+def openapi_document() -> dict[str, Any]:
+    def ref(name: str) -> dict[str, str]:
+        return {"$ref": f"#/components/schemas/{name}"}
+
+    def json_response(schema: dict[str, Any], description: str = "OK") -> dict[str, Any]:
+        return {"description": description, "content": {"application/json": {"schema": schema}}}
+
+    def request_body(schema: dict[str, Any], *, required: bool = True) -> dict[str, Any]:
+        return {"required": required, "content": {"application/json": {"schema": schema}}}
+
+    owner_param = {"$ref": "#/components/parameters/ownerId"}
+    thread_param = {"$ref": "#/components/parameters/threadId"}
+    turn_param = {"$ref": "#/components/parameters/turnId"}
+    return {
+        "openapi": "3.1.0",
+        "info": {"title": "Codex Broker", "version": __version__},
+        "security": [{"bearerAuth": []}, {"brokerKey": []}],
+        "paths": {
+            "/healthz": {
+                "get": {"security": [], "responses": {"200": json_response(ref("Health"), "Healthy")}}
+            },
+            "/readyz": {
+                "get": {
+                    "security": [],
+                    "responses": {
+                        "200": json_response(ref("Readiness"), "Ready"),
+                        "503": json_response(ref("Readiness"), "Not ready"),
+                    },
+                }
+            },
+            "/metrics": {
+                "get": {
+                    "responses": {
+                        "200": {
+                            "description": "Prometheus metrics",
+                            "content": {"text/plain": {"schema": {"type": "string"}}},
+                        }
+                    },
+                }
+            },
+            "/openapi.json": {
+                "get": {"responses": {"200": json_response({"type": "object"}, "OpenAPI document")}}
+            },
+            **account_api.openapi_paths(owner_param, ref, json_response, request_body),
+            **auth_api.openapi_paths(owner_param, ref, json_response, request_body),
+            **openai_api.openapi_paths(ref, json_response, request_body),
+            "/v1/owners/{ownerId}/audit-logs": {
+                "get": {
+                    "parameters": [
+                        owner_param,
+                        {"$ref": "#/components/parameters/profile"},
+                        {"$ref": "#/components/parameters/action"},
+                        {"$ref": "#/components/parameters/threadIdQuery"},
+                        {"$ref": "#/components/parameters/turnIdQuery"},
+                        {"$ref": "#/components/parameters/after"},
+                        {"$ref": "#/components/parameters/limit"},
+                    ],
+                    "responses": {"200": json_response(ref("AuditLogList"), "Owner-scoped audit logs")},
+                }
+            },
+            "/v1/owners/{ownerId}/threads": {
+                "post": {
+                    "parameters": [owner_param],
+                    "requestBody": request_body(ref("ThreadCreateRequest"), required=False),
+                    "responses": {
+                        "201": json_response(ref("Thread"), "Thread created"),
+                        "403": json_response(ref("Error"), "Auth principal not permitted"),
+                        "409": json_response(ref("Error"), "Thread auth binding conflict"),
+                    },
+                }
+            },
+            "/v1/owners/{ownerId}/threads/{threadId}": {
+                "get": {"parameters": [owner_param, thread_param], "responses": {"200": json_response(ref("Thread"))}}
+            },
+            "/v1/owners/{ownerId}/threads/{threadId}/archive": {
+                "post": {
+                    "parameters": [owner_param, thread_param],
+                    "responses": {"200": json_response(ref("Thread"), "Thread archived")},
+                }
+            },
+            "/v1/owners/{ownerId}/threads/{threadId}/turns": {
+                "post": {
+                    "parameters": [
+                        owner_param,
+                        thread_param,
+                        {
+                            "name": "X-Codex-Broker-Danger-Full-Access-Key",
+                            "in": "header",
+                            "required": False,
+                            "schema": {"type": "string", "format": "password"},
+                            "description": (
+                                "Separate deployment credential required only when codexOptions.sandbox "
+                                "selects danger-full-access. The normal broker API key is not sufficient."
+                            ),
+                        },
+                    ],
+                    "requestBody": request_body(ref("TurnStartRequest")),
+                    "responses": {
+                        "202": json_response(ref("Turn"), "Turn accepted"),
+                        "403": json_response(ref("Error"), "Auth principal not permitted"),
+                        "409": json_response(ref("Error"), "Thread auth binding conflict"),
+                    },
+                }
+            },
+            "/v1/owners/{ownerId}/threads/{threadId}/turns/{turnId}": {
+                "get": {
+                    "parameters": [owner_param, thread_param, turn_param],
+                    "responses": {"200": json_response(ref("Turn"))},
+                }
+            },
+            "/v1/owners/{ownerId}/threads/{threadId}/turns/{turnId}/steer": {
+                "post": {
+                    "parameters": [owner_param, thread_param, turn_param],
+                    "requestBody": request_body(ref("TurnSteerRequest")),
+                    "responses": {"200": json_response(ref("Turn"), "Turn steered")},
+                }
+            },
+            "/v1/owners/{ownerId}/threads/{threadId}/turns/{turnId}/interrupt": {
+                "post": {
+                    "parameters": [owner_param, thread_param, turn_param],
+                    "responses": {"200": json_response(ref("Turn"), "Turn interrupted")},
+                }
+            },
+            "/v1/owners/{ownerId}/threads/{threadId}/events": {
+                "get": {
+                    "parameters": [owner_param, thread_param, {"$ref": "#/components/parameters/after"}, {"$ref": "#/components/parameters/turnIdQuery"}],
+                    "responses": {
+                        "200": {
+                            "description": "SSE event stream of BrokerEvent JSON payloads",
+                            "content": {"text/event-stream": {"schema": ref("BrokerEvent")}},
+                        }
+                    },
+                }
+            },
+            "/v1/owners/{ownerId}/threads/{threadId}/interactions": {
+                "get": {
+                    "parameters": [owner_param, thread_param, {"$ref": "#/components/parameters/turnIdQuery"}, {"$ref": "#/components/parameters/status"}, {"$ref": "#/components/parameters/limit"}],
+                    "responses": {"200": json_response(ref("InteractionList"), "Thread interactions")},
+                }
+            },
+            "/v1/owners/{ownerId}/threads/{threadId}/turns/{turnId}/interactions": {
+                "get": {
+                    "parameters": [owner_param, thread_param, turn_param, {"$ref": "#/components/parameters/status"}, {"$ref": "#/components/parameters/limit"}],
+                    "responses": {"200": json_response(ref("InteractionList"), "Turn interactions")},
+                }
+            },
+            "/v1/owners/{ownerId}/threads/{threadId}/turns/{turnId}/interactions/{interactionId}": {
+                "get": {
+                    "parameters": [owner_param, thread_param, turn_param, {"$ref": "#/components/parameters/interactionId"}],
+                    "responses": {"200": json_response(ref("Interaction"), "Interaction")},
+                }
+            },
+            "/v1/owners/{ownerId}/threads/{threadId}/turns/{turnId}/interactions/{interactionId}/resolve": {
+                "post": {
+                    "parameters": [owner_param, thread_param, turn_param, {"$ref": "#/components/parameters/interactionId"}],
+                    "requestBody": request_body(ref("InteractionResolveRequest")),
+                    "responses": {"200": json_response(ref("Interaction"), "Interaction resolved")},
+                }
+            },
+            "/v1/bundles/inline": {
+                "post": {
+                    "requestBody": request_body(ref("TaskBundle")),
+                    "responses": {"201": json_response(ref("BundleAccepted"), "Inline bundle accepted")},
+                }
+            },
+        },
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "bearerFormat": "API key",
+                },
+                "brokerKey": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-Codex-Broker-Key",
+                },
+                "openaiCompatBearer": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "bearerFormat": "OpenAI-compatible API key",
+                },
+            },
+            "parameters": {
+                "ownerId": {"name": "ownerId", "in": "path", "required": True, "schema": {"type": "string"}},
+                "threadId": {"name": "threadId", "in": "path", "required": True, "schema": {"type": "string"}},
+                "turnId": {"name": "turnId", "in": "path", "required": True, "schema": {"type": "string"}},
+                "interactionId": {"name": "interactionId", "in": "path", "required": True, "schema": {"type": "string"}},
+                "threadIdQuery": {"name": "threadId", "in": "query", "required": False, "schema": {"type": "string"}},
+                "turnIdQuery": {"name": "turnId", "in": "query", "required": False, "schema": {"type": "string"}},
+                "profile": {"name": "profile", "in": "query", "required": False, "schema": {"type": "string", "default": "default"}},
+                "authPrincipalId": {
+                    "name": "authPrincipalId",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "string"},
+                    "description": "Optional assertion of the trusted host's configured auth principal for this owner.",
+                },
+                "after": {"name": "after", "in": "query", "required": False, "schema": {"type": "integer", "minimum": 0, "default": 0}},
+                "action": {"name": "action", "in": "query", "required": False, "schema": {"type": "string"}},
+                "status": {"name": "status", "in": "query", "required": False, "schema": {"type": "string"}},
+                "limit": {"name": "limit", "in": "query", "required": False, "schema": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}},
+                "cursor": {
+                    "name": "cursor",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "string"},
+                    "description": "Opaque cursor returned by a previous model discovery request.",
+                },
+                "includeHidden": {
+                    "name": "includeHidden",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "boolean", "default": False},
+                    "description": "Include models hidden from Codex's default picker list.",
+                },
+            },
+            "schemas": {
+                **account_api.openapi_schemas(),
+                **auth_api.openapi_schemas(ref),
+                **openai_api.openapi_schemas(),
+                "Error": {"type": "object", "required": ["error"], "properties": {"error": {"type": "string"}}},
+                "Health": {"type": "object", "required": ["status"], "properties": {"status": {"const": "ok"}}},
+                "Readiness": {
+                    "type": "object",
+                    "required": ["status", "errors", "sandboxPreflight"],
+                    "properties": {
+                        "status": {"enum": ["ready", "not_ready"]},
+                        "errors": {"type": "array", "items": {"type": "string"}},
+                        "sandboxPreflight": {"$ref": "#/components/schemas/SandboxPreflight"},
+                    },
+                },
+                "SandboxPreflight": {
+                    "type": "object",
+                    "required": [
+                        "status",
+                        "platform",
+                        "backend",
+                        "codexVersion",
+                        "permissionProfile",
+                        "checkedAt",
+                        "durationSeconds",
+                    ],
+                    "properties": {
+                        "status": {"enum": ["healthy", "failed", "unsupported", "skipped"]},
+                        "platform": {"type": "string"},
+                        "backend": {"type": ["string", "null"]},
+                        "codexVersion": {"type": ["string", "null"]},
+                        "permissionProfile": {"type": "string"},
+                        "checkedAt": {"type": "string", "format": "date-time"},
+                        "durationSeconds": {"type": "number", "minimum": 0},
+                    },
+                },
+                "AuditLog": {
+                    "type": "object",
+                    "required": ["id", "ownerHash", "authPrincipalHash", "action", "payload", "createdAt"],
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "ownerHash": {"type": "string"},
+                        "authPrincipalHash": {"type": "string"},
+                        "profile": {"type": ["string", "null"]},
+                        "threadId": {"type": ["string", "null"]},
+                        "turnId": {"type": ["string", "null"]},
+                        "action": {"type": "string"},
+                        "payload": {"type": "object", "additionalProperties": True},
+                        "createdAt": {"type": "string"},
+                    },
+                },
+                "AuditLogList": {
+                    "type": "object",
+                    "required": ["ownerHash", "auditLogs"],
+                    "properties": {
+                        "ownerHash": {"type": "string"},
+                        "auditLogs": {"type": "array", "items": ref("AuditLog")},
+                    },
+                },
+                "ThreadCreateRequest": {
+                    "type": "object",
+                    "properties": {
+                        "threadId": {"type": "string"},
+                        "authPrincipalId": {
+                            "type": "string",
+                            "description": "Optional assertion of the trusted owner-to-principal mapping configured by the host.",
+                        },
+                        "profile": {
+                            "type": "string",
+                            "default": "default",
+                            "description": "Immutable Codex auth profile for the lifetime of this broker thread.",
+                        },
+                        "configProfile": {"type": "string", "default": "default"},
+                        "runtimeProfile": {"type": "string", "deprecated": True},
+                        "hostApp": {"type": "string"},
+                        "bundleId": {"type": "string"},
+                        "cwd": {"type": "string"},
+                    },
+                },
+                "Thread": {
+                    "type": "object",
+                    "required": ["threadId", "authPrincipalHash", "profile", "configProfile", "status", "createdAt", "updatedAt"],
+                    "properties": {
+                        "threadId": {"type": "string"},
+                        "codexThreadId": {"type": ["string", "null"]},
+                        "authPrincipalHash": {"type": "string"},
+                        "profile": {"type": "string"},
+                        "configProfile": {"type": "string"},
+                        "hostApp": {"type": ["string", "null"]},
+                        "bundleId": {"type": ["string", "null"]},
+                        "cwd": {"type": ["string", "null"]},
+                        "status": {"type": "string"},
+                        "createdAt": {"type": "string"},
+                        "updatedAt": {"type": "string"},
+                    },
+                },
+                "InputItem": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "description": (
+                        "A Codex app-server input part. Low image detail is executed as high "
+                        "to avoid image omission in the pinned runtime; stored input is unchanged. Mix text parts "
+                        "(type: text, text) and image parts (type: image, url, optional detail) "
+                        "in order, or send images alone. Inline images use base64 data URLs. "
+                        "Native localImage parts refer to paths readable by the Codex runtime. "
+                        "Turn create and steer JSON bodies may be up to 32 MiB."
+                    ),
+                },
+                "CodexOptions": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "properties": {
+                        "approvalPolicy": {
+                            "oneOf": [
+                                {"type": "string"},
+                                {"type": "object", "additionalProperties": True},
+                            ]
+                        },
+                        "approvalsReviewer": {"enum": ["user", "auto_review"]},
+                        "approvals_reviewer": {
+                            "enum": ["user", "auto_review"],
+                            "description": "Snake-case alias for approvalsReviewer.",
+                        },
+                        "sandbox": {"enum": ["read-only", "workspace-write", "danger-full-access"]},
+                        "serviceTier": {
+                            "type": "string",
+                            "description": "Codex service-tier id for this turn, such as a Fast tier advertised by the selected model.",
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Codex model for this turn. Overrides the selected configuration profile; when omitted, the profile or Codex default applies.",
+                        },
+                        "effort": {
+                            "type": "string",
+                            "description": "Reasoning effort for this turn. Supported values depend on the selected Codex model.",
+                        },
+                        "reasoningEffort": {
+                            "type": "string",
+                            "description": "Alias for effort.",
+                        },
+                        "personality": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "reasoningSummary": {"type": "string"},
+                        "outputSchema": {
+                            "type": "object",
+                            "description": "JSON Schema used to constrain the final assistant message for the turn.",
+                            "additionalProperties": True,
+                        },
+                        "webSearch": {"type": "string"},
+                        "modelVerbosity": {"type": "string"},
+                        "imageGeneration": {"type": "boolean"},
+                    },
+                },
+                "TurnStartRequest": {
+                    "type": "object",
+                    "required": ["input"],
+                    "properties": {
+                        "input": {"type": "array", "minItems": 1, "items": ref("InputItem")},
+                        "mode": {"enum": ["reject", "queue", "steer"], "default": "reject"},
+                        "authPrincipalId": {
+                            "type": "string",
+                            "description": "Optional consistency assertion; it must resolve to the thread's immutable auth principal.",
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": "Optional consistency assertion; it must equal the thread's immutable auth profile.",
+                        },
+                        "configProfile": {"type": "string"},
+                        "runtimeProfile": {"type": "string", "deprecated": True},
+                        "hostApp": {"type": "string"},
+                        "bundleId": {"type": "string"},
+                        "cwd": {"type": "string"},
+                        "codexOptions": {
+                            **ref("CodexOptions"),
+                            "description": "Per-turn Codex options. Values override the selected configuration profile without modifying it.",
+                        },
+                        "runtime": ref("CodexOptions"),
+                        "stream": {"type": "boolean", "default": True},
+                        "idempotencyKey": {"type": "string"},
+                        "productCorrelationId": {"type": "string"},
+                        "correlationId": {"type": "string"},
+                    },
+                },
+                "TurnSteerRequest": {
+                    "type": "object",
+                    "required": ["input"],
+                    "properties": {"input": {"type": "array", "minItems": 1, "items": ref("InputItem")}},
+                },
+                "TokenUsageCounts": {
+                    "type": "object",
+                    "required": [
+                        "totalTokens",
+                        "inputTokens",
+                        "cachedInputTokens",
+                        "outputTokens",
+                        "reasoningOutputTokens",
+                    ],
+                    "properties": {
+                        "totalTokens": {"type": "integer", "minimum": 0},
+                        "inputTokens": {"type": "integer", "minimum": 0},
+                        "cachedInputTokens": {"type": "integer", "minimum": 0},
+                        "outputTokens": {"type": "integer", "minimum": 0},
+                        "reasoningOutputTokens": {"type": "integer", "minimum": 0},
+                    },
+                },
+                "TurnUsage": {
+                    "type": "object",
+                    "required": ["turn", "thread", "modelContextWindow"],
+                    "properties": {
+                        "turn": ref("TokenUsageCounts"),
+                        "thread": ref("TokenUsageCounts"),
+                        "modelContextWindow": {"type": "integer", "minimum": 0},
+                    },
+                },
+                "Turn": {
+                    "type": "object",
+                    "required": [
+                        "threadId",
+                        "turnId",
+                        "authPrincipalHash",
+                        "profile",
+                        "configProfile",
+                        "mode",
+                        "status",
+                        "createdAt",
+                        "updatedAt",
+                        "streamUrl",
+                        "usage",
+                    ],
+                    "properties": {
+                        "threadId": {"type": "string"},
+                        "turnId": {"type": "string"},
+                        "codexTurnId": {"type": ["string", "null"]},
+                        "authPrincipalHash": {"type": "string"},
+                        "profile": {"type": "string"},
+                        "configProfile": {"type": "string"},
+                        "hostApp": {"type": ["string", "null"]},
+                        "bundleId": {"type": ["string", "null"]},
+                        "cwd": {"type": ["string", "null"]},
+                        "mode": {"type": "string"},
+                        "productCorrelationId": {"type": ["string", "null"]},
+                        "status": {"type": "string"},
+                        "error": {"type": ["string", "null"]},
+                        "errorCode": {"type": ["string", "null"]},
+                        "publicMessage": {"type": ["string", "null"]},
+                        "adminMessage": {"type": ["string", "null"]},
+                        "createdAt": {"type": "string"},
+                        "startedAt": {"type": ["string", "null"]},
+                        "completedAt": {"type": ["string", "null"]},
+                        "updatedAt": {"type": "string"},
+                        "streamUrl": {"type": "string"},
+                        "usage": {
+                            "description": "Exact Codex-reported turn and cumulative thread token usage. Null until the runtime reports usage.",
+                            "anyOf": [ref("TurnUsage"), {"type": "null"}],
+                        },
+                        "execution": {
+                            "type": "object",
+                            "required": ["requestFingerprint", "bundleDigest", "resolvedOptions", "brokerVersion"],
+                            "properties": {
+                                "requestFingerprint": {"type": ["string", "null"]},
+                                "bundleDigest": {"type": ["string", "null"]},
+                                "resolvedOptions": {"type": ["object", "null"], "additionalProperties": True},
+                                "brokerVersion": {"type": ["string", "null"]},
+                            },
+                        },
+                    },
+                },
+                "BrokerEvent": {
+                    "type": "object",
+                    "required": ["id", "type", "threadId", "createdAt", "payload", "ambiguous"],
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "type": {"type": "string"},
+                        "ownerHash": {"type": "string"},
+                        "threadId": {"type": "string"},
+                        "turnId": {"type": ["string", "null"]},
+                        "productCorrelationId": {"type": ["string", "null"]},
+                        "codexThreadId": {"type": ["string", "null"]},
+                        "codexTurnId": {"type": ["string", "null"]},
+                        "createdAt": {"type": "string"},
+                        "payload": {"type": "object", "additionalProperties": True},
+                        "ambiguous": {"type": "boolean"},
+                        "rawMethod": {"type": "string"},
+                        "rawParams": {"type": "object", "additionalProperties": True},
+                    },
+                },
+                "Interaction": {
+                    "type": "object",
+                    "required": ["interactionId", "threadId", "turnId", "kind", "method", "status", "request", "fallbackResponse", "createdAt", "updatedAt"],
+                    "properties": {
+                        "interactionId": {"type": "string"},
+                        "threadId": {"type": "string"},
+                        "turnId": {"type": "string"},
+                        "productCorrelationId": {"type": ["string", "null"]},
+                        "codexThreadId": {"type": ["string", "null"]},
+                        "codexTurnId": {"type": ["string", "null"]},
+                        "kind": {"enum": ["approval", "permissions", "userInput", "mcpElicitation", "serverRequest"]},
+                        "method": {"type": "string"},
+                        "status": {"type": "string"},
+                        "request": {"type": "object", "additionalProperties": True},
+                        "response": {"type": ["object", "null"], "additionalProperties": True},
+                        "fallbackResponse": {"type": "object", "additionalProperties": True},
+                        "resolutionSource": {"type": ["string", "null"]},
+                        "createdAt": {"type": "string"},
+                        "expiresAt": {"type": ["string", "null"]},
+                        "resolvedAt": {"type": ["string", "null"]},
+                        "updatedAt": {"type": "string"},
+                    },
+                },
+                "InteractionList": {
+                    "type": "object",
+                    "required": ["interactions"],
+                    "properties": {"interactions": {"type": "array", "items": ref("Interaction")}},
+                },
+                "InteractionResolveRequest": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "properties": {
+                        "response": {"type": "object", "additionalProperties": True},
+                        "decision": {},
+                        "permissions": {"type": "object", "additionalProperties": True},
+                        "scope": {"enum": ["turn", "session"]},
+                        "strictAutoReview": {"type": ["boolean", "null"]},
+                        "answers": {"type": "object", "additionalProperties": True},
+                        "action": {"enum": ["accept", "decline", "cancel"]},
+                        "content": {},
+                        "_meta": {},
+                    },
+                },
+                "TaskBundle": {
+                    "type": "object",
+                    "required": ["id"],
+                    "additionalProperties": True,
+                    "properties": {
+                        "id": {"type": "string"},
+                        "version": {"type": "string"},
+                        "instructions": {"type": "array", "items": {"type": "string"}},
+                        "skills": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                        "prompts": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                        "mcpServers": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                        "tools": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+                        "allowedPaths": {"type": "array", "items": {"type": "string"}},
+                        "sandbox": {"type": "object", "additionalProperties": True},
+                    },
+                },
+                "BundleAccepted": {
+                    "type": "object",
+                    "required": ["bundleId", "digest", "source"],
+                    "properties": {"bundleId": {"type": "string"}, "digest": {"type": "string"}, "source": {"type": "string"}},
+                },
+            },
+        },
+    }

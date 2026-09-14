@@ -1,0 +1,65 @@
+# Based on the pinned upstream Dockerfile; adds project tools and suite scripts.
+FROM python:3.12-slim
+
+ARG CODEX_VERSION=0.153.4
+ARG TARGETARCH
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/broker \
+    CODEX_BROKER_HOST=0.0.0.0 \
+    CODEX_BROKER_PORT=3400 \
+    CODEX_BROKER_DATA_DIR=/data \
+    CODEX_BROKER_ALLOWED_WORKSPACE_ROOTS=/workspaces \
+    CODEX_BROKER_ALLOWED_BUNDLE_ROOTS=/bundles \
+    CODEX_BROKER_INTERNAL_KEY_FILE=/run/secrets/codex_broker_key
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bubblewrap ca-certificates curl tar git ripgrep nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) codex_arch="x86_64" ;; \
+      arm64) codex_arch="aarch64" ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    archive="codex-package-${codex_arch}-unknown-linux-musl.tar.gz"; \
+    curl -fsSL -o "/tmp/${archive}" "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${archive}"; \
+    curl -fsSL -o /tmp/codex-package_SHA256SUMS "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-package_SHA256SUMS"; \
+    expected="$(awk -v asset="${archive}" '$2 == asset { print $1; exit }' /tmp/codex-package_SHA256SUMS)"; \
+    test "${#expected}" -eq 64; \
+    printf '%s  %s\n' "${expected}" "/tmp/${archive}" | sha256sum -c -; \
+    mkdir -p /opt/codex; \
+    tar -xzf "/tmp/${archive}" -C /opt/codex; \
+    ln -s /opt/codex/bin/codex /usr/local/bin/codex; \
+    rm -f "/tmp/${archive}" /tmp/codex-package_SHA256SUMS; \
+    codex --version
+
+# The default-deny permission profiles retain Codex's :minimal runtime reads,
+# which include /usr/local but intentionally do not expose arbitrary /opt data.
+# Keep the CLI and its sibling code-mode host together as real executables.
+RUN cp --remove-destination /opt/codex/bin/* /usr/local/bin/ \
+    && test -x /usr/local/bin/codex-code-mode-host
+
+RUN mv /usr/bin/bwrap /usr/bin/bwrap-real
+
+COPY --chmod=755 broker/scripts/codex-bwrap-no-proc /usr/bin/bwrap
+
+RUN useradd --create-home --shell /usr/sbin/nologin broker \
+    && mkdir -p /data /workspaces /bundles \
+    && chown -R broker:broker /data /workspaces /bundles /home/broker
+
+WORKDIR /app
+COPY broker/pyproject.toml broker/README.md ./
+COPY broker/src ./src
+RUN pip install --no-cache-dir .
+
+COPY profiles.json init_suite.py client.py /app/
+USER broker
+EXPOSE 3400
+VOLUME ["/data"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${CODEX_BROKER_PORT:-3400}/readyz" >/dev/null || exit 1
+
+CMD ["codex-broker"]

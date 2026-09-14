@@ -1,0 +1,900 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from .config import BrokerConfig
+from .identity import AuthPrincipalPolicy, AuthScope
+from .runtime_errors import CODEX_AUTH_REQUIRES_ADMIN, classify_runtime_error
+from .security import SENSITIVE_KEY_PATTERN, SecretSanitizer
+from .state import StateStore
+from .util import clean_process_env, ensure_dir, env_with, owner_digest, redact, utc_now
+
+
+ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+URL_RE = re.compile(r"https?://[^\s\"'<>]+")
+STRICT_CODE_RE = re.compile(r"\b([A-Z0-9]{4,8}-[A-Z0-9]{4,8}(?:-[A-Z0-9]{4,8})?)\b")
+CONTEXT_CODE_RE = re.compile(r"\b([A-Z0-9]{6,12})\b")
+EXPIRES_IN_RE = re.compile(r"\bexpires?\s+in\s+(\d+)\s+(seconds?|minutes?|hours?)\b", re.I)
+PROFILE_SAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
+AUTH_PROBE_PROMPT = "Reply exactly: OK"
+_PATH_SEGMENT_RE = re.compile(r"^[^/\\]+$")
+_WORKSPACE_SECRET_GLOBS = (
+    "**/.env",
+    "**/.env.*",
+    "**/*.key",
+    "**/*.pem",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/id_rsa",
+    "**/id_ed25519",
+    "**/id_dsa",
+    "**/id_ecdsa",
+)
+# Codex 0.151 materializes `:workspace_roots` deny globs for every runtime
+# root, and its `**/` glob prefix matches zero or more path components. Each
+# recursive pattern therefore denies both the root file and nested copies; do
+# not add exact root masks, because Bubblewrap may try to create absent paths.
+
+
+def _toml_string(value: str) -> str:
+    """Serialize a TOML basic string without interpolating untrusted text."""
+    return json.dumps(value)
+
+
+def render_managed_codex_config(config: BrokerConfig) -> str:
+    """Return the deterministic, broker-owned Codex configuration."""
+    denied_paths = {
+        str(config.auth_root.resolve()),
+        str(config.state_db_path.parent.resolve()),
+        "/run/secrets",
+        *(str(path.resolve()) for path in config.sandbox_deny_paths),
+    }
+
+    lines = [
+        f"cli_auth_credentials_store = {_toml_string(config.credential_store)}",
+        'default_permissions = "broker-read-only"',
+        "",
+    ]
+    profiles = (
+        ("broker-read-only", ":read-only", "read", ()),
+        ("broker-workspace-write", ":workspace", "write", (":slash_tmp", ":tmpdir")),
+    )
+    for name, extends, workspace_access, inherited_denies in profiles:
+        table = f"permissions.{name}"
+        filesystem_table = f"{table}.filesystem"
+        workspace_table = f'{filesystem_table}.":workspace_roots"'
+        lines.extend(
+            [
+                f"[{table}]",
+                f"extends = {_toml_string(extends)}",
+                "",
+                f"[{filesystem_table}]",
+                "glob_scan_max_depth = 12",
+                '":root" = "deny"',
+                '":minimal" = "read"',
+            ]
+        )
+        lines.extend(f"{_toml_string(path)} = \"deny\"" for path in (*inherited_denies, *sorted(denied_paths)))
+        lines.extend(["", f"[{workspace_table}]", f'"." = "{workspace_access}"'])
+        lines.extend(f'{_toml_string(pattern)} = "deny"' for pattern in _WORKSPACE_SECRET_GLOBS)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
+
+
+def extract_login_url(text: str) -> str | None:
+    match = URL_RE.search(strip_ansi(text))
+    return match.group(0).rstrip("),.;") if match else None
+
+
+def extract_user_code(text: str) -> str | None:
+    lines = [line.strip() for line in strip_ansi(text).replace("\r", "\n").splitlines() if line.strip()]
+    for line in lines:
+        for match in STRICT_CODE_RE.finditer(line):
+            token = match.group(1)
+            if any(char.isdigit() for char in token):
+                return token
+    for idx, line in enumerate(lines):
+        if not re.search(r"(login|verification|one-time|user|device)\s+code", line, re.I):
+            continue
+        context = "\n".join(lines[idx : idx + 3])
+        for match in CONTEXT_CODE_RE.finditer(context):
+            token = match.group(1)
+            if any(char.isdigit() for char in token):
+                return token
+    return None
+
+
+def extract_expires_at(text: str, *, now: datetime | None = None) -> str | None:
+    match = EXPIRES_IN_RE.search(strip_ansi(text))
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+    base = now or datetime.now(timezone.utc)
+    if unit.startswith("second"):
+        delta = timedelta(seconds=amount)
+    elif unit.startswith("minute"):
+        delta = timedelta(minutes=amount)
+    else:
+        delta = timedelta(hours=amount)
+    return (base + delta).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def normalize_profile(profile: str | None = None) -> str:
+    text = str(profile or "default").strip()
+    normalized = PROFILE_SAFE_RE.sub("_", text) or "default"
+    if normalized in {".", ".."}:
+        raise ValueError("Profile must contain at least one letter, number, underscore, or hyphen.")
+    return normalized
+
+
+@dataclass
+class DeviceAuthSession:
+    session_id: str
+    owner_hash: str
+    auth_principal_hash: str
+    profile: str
+    command: list[str]
+    started_at: str
+    updated_at: str
+    state: str = "starting"
+    completed_at: str | None = None
+    login_url: str | None = None
+    user_code: str | None = None
+    expires_at: str | None = None
+    output: list[str] = field(default_factory=list)
+    exit_code: int | None = None
+    error: str | None = None
+    process: subprocess.Popen[str] | None = None
+
+    def public(self) -> dict[str, Any]:
+        data = {
+            "sessionId": self.session_id,
+            "state": self.state,
+            "profile": self.profile,
+            "command": self.command,
+            "startedAt": self.started_at,
+            "updatedAt": self.updated_at,
+            "completedAt": self.completed_at,
+            "loginUrl": self.login_url,
+            "userCode": self.user_code,
+            "expiresAt": self.expires_at,
+            "output": [] if self.state == "completed" else self.output[-80:],
+            "exitCode": self.exit_code,
+            "error": self.error,
+        }
+        if self.state == "completed":
+            data["loginUrl"] = None
+            data["userCode"] = None
+            data["expiresAt"] = None
+        return data
+
+
+class AuthManager:
+    def __init__(
+        self,
+        config: BrokerConfig,
+        state: StateStore,
+        *,
+        sanitizer: SecretSanitizer | None = None,
+    ) -> None:
+        self.config = config
+        self.state = state
+        self.sanitizer = sanitizer or state.sanitizer
+        self.policy = AuthPrincipalPolicy(config)
+        self._sessions: dict[tuple[str, str], DeviceAuthSession] = {}
+        self._profile_locks: dict[tuple[str, str], threading.RLock] = {}
+        self._lock = threading.RLock()
+
+    def hash_owner(self, owner_id: str) -> str:
+        return owner_digest(owner_id, self.config.owner_hash_secret)
+
+    def resolve_scope(
+        self,
+        owner_id: str,
+        auth_principal_id: str | None = None,
+    ) -> AuthScope:
+        return self.policy.resolve(owner_id, auth_principal_id)
+
+    def hash_auth_principal(self, auth_principal_id: str) -> str:
+        return owner_digest(auth_principal_id, self.config.owner_hash_secret)
+
+    def profile_key(self, profile: str | None = None) -> str:
+        return normalize_profile(profile)
+
+    @contextmanager
+    def profile_guard(self, auth_principal_hash: str, profile: str = "default") -> Any:
+        key = (auth_principal_hash, self.profile_key(profile))
+        with self._lock:
+            lock = self._profile_locks.setdefault(key, threading.RLock())
+        with lock:
+            yield
+
+    def profile_home(self, auth_principal_hash: str, profile: str = "default") -> Path:
+        profile_key = self.profile_key(profile)
+        principal_key = self._principal_path_component(auth_principal_hash)
+        profiles_root = (self.config.auth_root / principal_key / "profiles").resolve()
+        home = (profiles_root / profile_key / "codex-home").resolve()
+        if not home.is_relative_to(profiles_root):
+            raise ValueError("Profile resolves outside the auth principal's authentication directory.")
+        ensure_dir(home)
+        for private_dir in (self.config.auth_root, profiles_root.parent, profiles_root, home.parent, home):
+            private_dir.chmod(0o700)
+        self._ensure_config(home)
+        self.state.ensure_profile(auth_principal_hash, profile_key)
+        return home
+
+    def runtime_home(self, auth_principal_hash: str, profile: str = "default") -> Path:
+        """Create the non-secret HOME used by the selected app-server profile."""
+        profile_key = self.profile_key(profile)
+        principal_key = self._principal_path_component(auth_principal_hash)
+        runtime_root = self.config.runtime_home_root.resolve()
+        home = (runtime_root / principal_key / "profiles" / profile_key).resolve()
+        if not home.is_relative_to(runtime_root):
+            raise ValueError("Profile resolves outside the broker runtime-home directory.")
+        ensure_dir(home)
+        for private_dir in (runtime_root, home.parent.parent, home.parent, home):
+            private_dir.chmod(0o700)
+        return home
+
+    def codex_env(self, auth_principal_hash: str, profile: str = "default") -> dict[str, str]:
+        profile_key = self.profile_key(profile)
+        home = self.profile_home(auth_principal_hash, profile_key)
+        return env_with(
+            clean_process_env(),
+            {
+                "CODEX_HOME": str(home),
+                "CODEX_CREDENTIAL_STORE": self.config.credential_store,
+                "HOME": str(home.parent),
+            },
+        )
+
+    def auth_file(self, auth_principal_hash: str, profile: str = "default") -> Path:
+        profile_key = self.profile_key(profile)
+        return self.profile_home(auth_principal_hash, profile_key) / "auth.json"
+
+    def auth_fingerprint(self, auth_principal_hash: str, profile: str = "default") -> str:
+        auth_file = self.auth_file(auth_principal_hash, profile)
+        if not auth_file.exists():
+            return "missing"
+        try:
+            digest = hashlib.sha256(auth_file.read_bytes()).hexdigest()
+            stat = auth_file.stat()
+        except OSError:
+            return "unreadable"
+        return f"sha256:{digest}:size:{stat.st_size}"
+
+    def refresh_profile_secrets(self, auth_principal_hash: str, profile: str = "default") -> None:
+        """Refresh exact sanitizer values from only the selected auth profile."""
+        profile_key = self.profile_key(profile)
+        scope = self._sanitizer_scope(auth_principal_hash, profile_key)
+        path = self.auth_file(auth_principal_hash, profile_key)
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self.sanitizer.remove_scope(scope)
+            return
+        self.sanitizer.replace_scope(scope, self._credential_string_leaves(parsed))
+
+    def remove_profile_secrets(self, auth_principal_hash: str, profile: str = "default") -> None:
+        self.sanitizer.remove_scope(self._sanitizer_scope(auth_principal_hash, self.profile_key(profile)))
+
+    @staticmethod
+    def _credential_string_leaves(value: Any, *, sensitive: bool = False) -> set[str]:
+        values: set[str] = set()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                values.update(
+                    AuthManager._credential_string_leaves(
+                        item,
+                        sensitive=sensitive or bool(SENSITIVE_KEY_PATTERN.search(str(key))),
+                    )
+                )
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                values.update(AuthManager._credential_string_leaves(item, sensitive=sensitive))
+        elif sensitive and isinstance(value, str) and value:
+            values.add(value)
+        return values
+
+    def _sanitizer_scope(self, auth_principal_hash: str, profile: str) -> str:
+        return f"auth-profile:{self._principal_path_component(auth_principal_hash)}:{self.profile_key(profile)}"
+
+    def mark_runtime_auth_failure(
+        self,
+        owner_hash: str,
+        auth_principal_hash: str,
+        profile: str,
+        *,
+        code: str,
+        admin_message: str,
+    ) -> None:
+        profile_key = self.profile_key(profile)
+        fingerprint = self.auth_fingerprint(auth_principal_hash, profile_key)
+        self.state.update_auth_status(
+            auth_principal_hash,
+            profile_key,
+            "refresh_failed",
+            auth_fingerprint=fingerprint,
+        )
+        self.state.append_audit(
+            owner_hash,
+            "auth.runtime.failure",
+            {"code": code, "authFingerprint": fingerprint, "adminMessage": redact(admin_message, 1200)},
+            auth_principal_hash=auth_principal_hash,
+            profile=profile_key,
+        )
+
+    def list_profiles(
+        self,
+        owner_id: str,
+        auth_principal_id: str | None = None,
+    ) -> dict[str, Any]:
+        scope = self.resolve_scope(owner_id, auth_principal_id)
+        profiles = [
+            {
+                "profile": row["profile"],
+                "state": row["auth_status"],
+                "authType": row.get("auth_type"),
+                "authFingerprint": row.get("auth_fingerprint"),
+                "createdAt": row["created_at"],
+                "updatedAt": row["updated_at"],
+            }
+            for row in self.state.list_profiles(scope.auth_principal_hash)
+        ]
+        return {**scope.public(), "profiles": profiles}
+
+    def status(
+        self,
+        owner_id: str,
+        profile: str = "default",
+        auth_principal_id: str | None = None,
+    ) -> dict[str, Any]:
+        profile_key = self.profile_key(profile)
+        scope = self.resolve_scope(owner_id, auth_principal_id)
+        principal_hash = scope.auth_principal_hash
+        home = self.profile_home(principal_hash, profile_key)
+        session = self._session(principal_hash, profile_key)
+        auth_file_exists = (home / "auth.json").exists()
+        fingerprint = self.auth_fingerprint(principal_hash, profile_key)
+        profile_row = self.state.get_profile(principal_hash, profile_key)
+        remembered_state = str(profile_row.get("auth_status")) if profile_row else "unknown"
+        remembered_fingerprint = str(profile_row.get("auth_fingerprint")) if profile_row and profile_row.get("auth_fingerprint") else None
+        state = "missing" if not auth_file_exists else "present_unverified"
+        output = ""
+        exit_code: int | None = None
+        command = [*self.config.codex_command, "login", "status"]
+        if shutil.which(self.config.codex_command[0]):
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=str(home),
+                    env=self.codex_env(principal_hash, profile_key),
+                    text=True,
+                    input="",
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                output = redact(f"{result.stdout}\n{result.stderr}".strip(), 1200)
+                exit_code = result.returncode
+                normalized = strip_ansi(output).lower()
+                if result.returncode == 0 and "not logged in" not in normalized and "not authenticated" not in normalized:
+                    if "logged in" in normalized or "authenticated" in normalized or auth_file_exists:
+                        state = "authenticated"
+                elif auth_file_exists:
+                    state = "invalid"
+                else:
+                    state = "missing"
+            except (OSError, subprocess.SubprocessError) as exc:
+                output = redact(str(exc), 1200)
+                state = "missing" if not auth_file_exists else "present_unverified"
+        auth_file_exists = (home / "auth.json").exists()
+        fingerprint = self.auth_fingerprint(principal_hash, profile_key)
+        if remembered_state == "refresh_failed" and remembered_fingerprint == fingerprint:
+            state = "refresh_failed"
+        self.state.update_auth_status(principal_hash, profile_key, state, auth_fingerprint=fingerprint)
+        return {
+            **scope.public(),
+            "profile": profile_key,
+            "state": state,
+            "deviceAuth": {**scope.public(), **session.public()} if session else None,
+            "authFilePresent": auth_file_exists,
+            "authFingerprint": fingerprint,
+            "loginStatusExitCode": exit_code,
+            "loginStatusOutput": output,
+        }
+
+    def probe(
+        self,
+        owner_id: str,
+        profile: str = "default",
+        auth_principal_id: str | None = None,
+    ) -> dict[str, Any]:
+        profile_key = self.profile_key(profile)
+        scope = self.resolve_scope(owner_id, auth_principal_id)
+        owner_hash = scope.owner_hash
+        principal_hash = scope.auth_principal_hash
+        home = self.profile_home(principal_hash, profile_key)
+        auth_file = home / "auth.json"
+        auth_file_exists = auth_file.exists()
+        previous_fingerprint = self.auth_fingerprint(principal_hash, profile_key)
+        started_at = utc_now()
+        started_monotonic = time.monotonic()
+        command = self._probe_command(home)
+        self.state.append_audit(
+            owner_hash,
+            "auth.probe.start",
+            {"authFingerprint": previous_fingerprint},
+            auth_principal_hash=principal_hash,
+            profile=profile_key,
+        )
+
+        output = ""
+        exit_code: int | None = None
+        error_code: str | None = None
+        public_message: str | None = None
+        admin_message: str | None = None
+        if not auth_file_exists:
+            state = "missing"
+            self.state.update_auth_status(principal_hash, profile_key, state, auth_fingerprint=previous_fingerprint)
+        else:
+            try:
+                timeout = max(5.0, min(float(self.config.request_timeout_seconds), 120.0))
+                result = subprocess.run(
+                    command,
+                    cwd=str(home),
+                    env=self.codex_env(principal_hash, profile_key),
+                    input=f"{AUTH_PROBE_PROMPT}\n",
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout,
+                    check=False,
+                )
+                exit_code = result.returncode
+                output = redact(f"{result.stdout}\n{result.stderr}".strip(), 2000)
+            except (OSError, subprocess.SubprocessError) as exc:
+                exit_code = -1
+                output = redact(str(exc), 2000)
+
+            normalized = strip_ansi(output).lower()
+            error_info = classify_runtime_error(output) if output else None
+            if error_info and error_info.code == CODEX_AUTH_REQUIRES_ADMIN:
+                state = "refresh_failed"
+                error_code = error_info.code
+                public_message = error_info.public_message
+                admin_message = error_info.admin_message
+                self.mark_runtime_auth_failure(
+                    owner_hash,
+                    principal_hash,
+                    profile_key,
+                    code=error_info.code,
+                    admin_message=error_info.admin_message,
+                )
+            elif exit_code == 0:
+                state = "authenticated"
+                self.state.update_auth_status(
+                    principal_hash,
+                    profile_key,
+                    state,
+                    auth_fingerprint=self.auth_fingerprint(principal_hash, profile_key),
+                )
+            elif "not logged in" in normalized or "not authenticated" in normalized:
+                state = "invalid" if auth_file.exists() else "missing"
+                self.state.update_auth_status(
+                    principal_hash,
+                    profile_key,
+                    state,
+                    auth_fingerprint=self.auth_fingerprint(principal_hash, profile_key),
+                )
+            else:
+                state = "failed"
+                if error_info:
+                    error_code = error_info.code
+                    public_message = error_info.public_message
+                    admin_message = error_info.admin_message
+                self.state.update_auth_status(
+                    principal_hash,
+                    profile_key,
+                    state,
+                    auth_fingerprint=self.auth_fingerprint(principal_hash, profile_key),
+                )
+
+        completed_at = utc_now()
+        fingerprint = self.auth_fingerprint(principal_hash, profile_key)
+        audit_payload = {
+            "state": state,
+            "exitCode": exit_code,
+            "errorCode": error_code,
+            "previousAuthFingerprint": previous_fingerprint,
+            "authFingerprint": fingerprint,
+        }
+        self.state.append_audit(
+            owner_hash,
+            "auth.probe.success" if state == "authenticated" else "auth.probe.failure",
+            audit_payload,
+            auth_principal_hash=principal_hash,
+            profile=profile_key,
+        )
+        return {
+            **scope.public(),
+            "profile": profile_key,
+            "state": state,
+            "authFilePresent": auth_file.exists(),
+            "authFingerprint": fingerprint,
+            "previousAuthFingerprint": previous_fingerprint,
+            "command": command,
+            "startedAt": started_at,
+            "completedAt": completed_at,
+            "durationMs": round((time.monotonic() - started_monotonic) * 1000, 3),
+            "exitCode": exit_code,
+            "output": output,
+            "errorCode": error_code,
+            "publicMessage": public_message,
+            "adminMessage": admin_message,
+        }
+
+    def start_device_auth(
+        self,
+        owner_id: str,
+        profile: str = "default",
+        auth_principal_id: str | None = None,
+    ) -> dict[str, Any]:
+        profile_key = self.profile_key(profile)
+        scope = self.resolve_scope(owner_id, auth_principal_id)
+        key = (scope.auth_principal_hash, profile_key)
+        with self.profile_guard(*key), self._lock:
+            existing = self._sessions.get(key)
+            if existing and existing.process and existing.process.poll() is None:
+                return {**scope.public(), **existing.public()}
+            session = DeviceAuthSession(
+                session_id=f"codex-auth-{scope.auth_principal_hash[:12]}-{int(threading.get_native_id())}",
+                owner_hash=scope.owner_hash,
+                auth_principal_hash=scope.auth_principal_hash,
+                profile=profile_key,
+                command=[*self.config.codex_command, "login", "--device-auth"],
+                started_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            self._sessions[key] = session
+            self.state.append_audit(
+                scope.owner_hash,
+                "auth.device.start",
+                {"sessionId": session.session_id},
+                auth_principal_hash=scope.auth_principal_hash,
+                profile=profile_key,
+            )
+            try:
+                self._spawn_device_auth(session)
+            except (OSError, subprocess.SubprocessError) as exc:
+                error = redact(str(exc), 1200)
+                session.state = "failed"
+                session.error = error
+                session.output.append(error)
+                session.exit_code = -1
+                session.completed_at = utc_now()
+                session.updated_at = session.completed_at
+                self.state.update_auth_status(scope.auth_principal_hash, profile_key, "failed", "chatgpt")
+                self.state.append_audit(
+                    scope.owner_hash,
+                    "auth.device.failure",
+                    {"sessionId": session.session_id, "exitCode": -1},
+                    auth_principal_hash=scope.auth_principal_hash,
+                    profile=profile_key,
+                )
+            return {**scope.public(), **session.public()}
+
+    def submit_device_code(
+        self,
+        owner_id: str,
+        code: str,
+        profile: str = "default",
+        session_id: str | None = None,
+        auth_principal_id: str | None = None,
+    ) -> dict[str, Any]:
+        profile_key = self.profile_key(profile)
+        scope = self.resolve_scope(owner_id, auth_principal_id)
+        session = self._session(scope.auth_principal_hash, profile_key)
+        if not session or not session.process or session.process.poll() is not None:
+            raise ValueError("No active Codex device-auth session.")
+        if session_id and session.session_id != session_id:
+            raise ValueError("Codex device-auth session id does not match the active session.")
+        if not code.strip():
+            raise ValueError("Login code is required.")
+        assert session.process.stdin is not None
+        session.process.stdin.write(f"{code.strip()}\n")
+        session.process.stdin.flush()
+        session.state = "submitting_code"
+        session.updated_at = utc_now()
+        return {**scope.public(), **session.public()}
+
+    def login_api_key(
+        self,
+        owner_id: str,
+        api_key: str,
+        profile: str = "default",
+        auth_principal_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not api_key.strip():
+            raise ValueError("apiKey is required.")
+        profile_key = self.profile_key(profile)
+        scope = self.resolve_scope(owner_id, auth_principal_id)
+        with self.profile_guard(scope.auth_principal_hash, profile_key):
+            home = self.profile_home(scope.auth_principal_hash, profile_key)
+            command = [*self.config.codex_command, "login", "--with-api-key"]
+            self.state.append_audit(
+                scope.owner_hash,
+                "auth.api_key.start",
+                {},
+                auth_principal_hash=scope.auth_principal_hash,
+                profile=profile_key,
+            )
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=str(home),
+                    env=self.codex_env(scope.auth_principal_hash, profile_key),
+                    input=f"{api_key.strip()}\n",
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+                exit_code = result.returncode
+                output = redact(f"{result.stdout}\n{result.stderr}".strip(), 1200)
+            except (OSError, subprocess.SubprocessError) as exc:
+                exit_code = -1
+                output = redact(str(exc), 1200)
+            status = "authenticated" if exit_code == 0 else "failed"
+            fingerprint = self.auth_fingerprint(scope.auth_principal_hash, profile_key)
+            self.state.update_auth_status(
+                scope.auth_principal_hash,
+                profile_key,
+                status,
+                "api-key",
+                fingerprint,
+            )
+            self.state.append_audit(
+                scope.owner_hash,
+                "auth.api_key.success" if status == "authenticated" else "auth.api_key.failure",
+                {"exitCode": exit_code},
+                auth_principal_hash=scope.auth_principal_hash,
+                profile=profile_key,
+            )
+            return {
+                **scope.public(),
+                "profile": profile_key,
+                "state": status,
+                "authFingerprint": fingerprint,
+                "exitCode": exit_code,
+                "output": output,
+            }
+
+    def logout(
+        self,
+        owner_id: str,
+        profile: str = "default",
+        *,
+        delete_profile: bool = False,
+        auth_principal_id: str | None = None,
+    ) -> dict[str, Any]:
+        profile_key = self.profile_key(profile)
+        scope = self.resolve_scope(owner_id, auth_principal_id)
+        principal_hash = scope.auth_principal_hash
+        with self.profile_guard(principal_hash, profile_key):
+            home = self.profile_home(principal_hash, profile_key)
+            with self._lock:
+                key = (principal_hash, profile_key)
+                session = self._sessions.pop(key, None) if delete_profile else self._sessions.get(key)
+            if session:
+                self._terminate_session(session)
+            try:
+                result = subprocess.run(
+                    [*self.config.codex_command, "logout"],
+                    cwd=str(home),
+                    env=self.codex_env(principal_hash, profile_key),
+                    text=True,
+                    capture_output=True,
+                    timeout=15,
+                    check=False,
+                )
+                exit_code = result.returncode
+                output = redact(f"{result.stdout}\n{result.stderr}".strip(), 1200)
+            except (OSError, subprocess.SubprocessError) as exc:
+                exit_code = -1
+                output = redact(str(exc), 1200)
+            auth_file = home / "auth.json"
+            if auth_file.exists():
+                auth_file.unlink()
+            self.remove_profile_secrets(principal_hash, profile_key)
+            deleted = False
+            if delete_profile:
+                profiles_root = (self.config.auth_root / self._principal_path_component(principal_hash) / "profiles").resolve()
+                profile_dir = home.parent.resolve()
+                if not profile_dir.is_relative_to(profiles_root) or profile_dir == profiles_root:
+                    raise ValueError("Refusing to delete a profile outside the authentication directory.")
+                if profile_dir.exists():
+                    shutil.rmtree(profile_dir)
+                if profile_dir.exists():
+                    raise OSError("Codex auth profile directory still exists after deletion.")
+                self.state.delete_profile(principal_hash, profile_key)
+                self.state.append_audit(
+                    scope.owner_hash,
+                    "auth.profile.delete",
+                    {"exitCode": exit_code},
+                    auth_principal_hash=principal_hash,
+                    profile=profile_key,
+                )
+                deleted = True
+            else:
+                self.state.update_auth_status(
+                    principal_hash,
+                    profile_key,
+                    "missing",
+                    auth_fingerprint=self.auth_fingerprint(principal_hash, profile_key),
+                )
+            self.state.append_audit(
+                scope.owner_hash,
+                "auth.logout",
+                {"exitCode": exit_code, "deleteProfile": delete_profile},
+                auth_principal_hash=principal_hash,
+                profile=profile_key,
+            )
+            return {
+                **scope.public(),
+                "profile": profile_key,
+                "state": "deleted" if deleted else "unauthenticated",
+                "deleted": deleted,
+                "exitCode": exit_code,
+                "output": output,
+            }
+
+    def _session(self, auth_principal_hash: str, profile: str) -> DeviceAuthSession | None:
+        with self._lock:
+            return self._sessions.get((auth_principal_hash, profile))
+
+    @staticmethod
+    def _terminate_session(session: DeviceAuthSession) -> None:
+        process = session.process
+        if not process or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+
+    def _ensure_config(self, home: Path) -> None:
+        config_path = home / "config.toml"
+        desired = render_managed_codex_config(self.config)
+        if not config_path.exists() or config_path.read_text(encoding="utf-8") != desired:
+            config_path.write_text(desired, encoding="utf-8")
+        config_path.chmod(0o600)
+
+    @staticmethod
+    def _principal_path_component(auth_principal_hash: str) -> str:
+        if not auth_principal_hash or auth_principal_hash in {".", ".."} or not _PATH_SEGMENT_RE.fullmatch(auth_principal_hash):
+            raise ValueError("Authentication principal hash must be one safe path component.")
+        return auth_principal_hash
+
+    def _probe_command(self, home: Path) -> list[str]:
+        return [
+            *self.config.codex_command,
+            "--ask-for-approval",
+            "never",
+            "exec",
+            "-c",
+            'model_reasoning_effort="low"',
+            "--cd",
+            str(home),
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "-s",
+            "read-only",
+            "--json",
+            "-",
+        ]
+
+    def _spawn_device_auth(self, session: DeviceAuthSession) -> None:
+        principal_hash = session.auth_principal_hash
+        home = self.profile_home(principal_hash, session.profile)
+        process = subprocess.Popen(
+            session.command,
+            cwd=str(home),
+            env=self.codex_env(principal_hash, session.profile),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        session.process = process
+        assert process.stdout is not None
+        assert process.stderr is not None
+        threading.Thread(target=self._read_auth_stream, args=(session, process.stdout), daemon=True).start()
+        threading.Thread(target=self._read_auth_stream, args=(session, process.stderr), daemon=True).start()
+        threading.Thread(target=self._wait_auth_process, args=(session,), daemon=True).start()
+
+    def _read_auth_stream(self, session: DeviceAuthSession, stream: Any) -> None:
+        try:
+            for chunk in stream:
+                lines = [line.strip() for line in strip_ansi(chunk).replace("\r", "\n").splitlines() if line.strip()]
+                if not lines:
+                    continue
+                with self._lock:
+                    session.output.extend(redact(line, 800) for line in lines)
+                    session.output = session.output[-80:]
+                    text = "\n".join(session.output)
+                    session.login_url = extract_login_url(text) or session.login_url
+                    session.user_code = extract_user_code(text) or session.user_code
+                    session.expires_at = extract_expires_at(text) or session.expires_at
+                    if session.state == "starting" and (session.login_url or session.user_code):
+                        session.state = "waiting_for_login"
+                    session.updated_at = utc_now()
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def _wait_auth_process(self, session: DeviceAuthSession) -> None:
+        assert session.process is not None
+        principal_hash = session.auth_principal_hash
+        code = session.process.wait()
+        if session.process.stdin:
+            try:
+                session.process.stdin.close()
+            except OSError:
+                pass
+        with self.profile_guard(principal_hash, session.profile), self._lock:
+            session.exit_code = code
+            session.completed_at = utc_now()
+            session.updated_at = session.completed_at
+            if self._sessions.get((principal_hash, session.profile)) is not session:
+                session.state = "cancelled"
+                session.error = "Authentication was cancelled."
+                return
+            if code == 0:
+                session.error = None
+                self.state.update_auth_status(
+                    principal_hash,
+                    session.profile,
+                    "authenticated",
+                    "chatgpt",
+                    self.auth_fingerprint(principal_hash, session.profile),
+                )
+                self.state.append_audit(
+                    session.owner_hash,
+                    "auth.device.success",
+                    {"sessionId": session.session_id},
+                    auth_principal_hash=principal_hash,
+                    profile=session.profile,
+                )
+                session.state = "completed"
+            else:
+                session.error = session.output[-1] if session.output else f"codex login exited with {code}"
+                self.state.update_auth_status(principal_hash, session.profile, "failed", "chatgpt")
+                self.state.append_audit(
+                    session.owner_hash,
+                    "auth.device.failure",
+                    {"sessionId": session.session_id, "exitCode": code},
+                    auth_principal_hash=principal_hash,
+                    profile=session.profile,
+                )
+                session.state = "failed"
