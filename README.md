@@ -15,7 +15,6 @@
 
 Το build υποστηρίζει `amd64` και `arm64`. Δεν είναι image για Windows containers.
 Ο host πρέπει να επιτρέπει τα Linux user namespaces που χρειάζεται το sandbox.
-Σε Linux hosts με AppArmor χρειάζεται το πρόσθετο βήμα παρακάτω.
 Συστήματα με πρόσθετους περιορισμούς, όπως Enhanced Container Isolation ή
 απενεργοποιημένα unprivileged user namespaces, χρειάζονται επιπλέον έλεγχο συμβατότητας.
 
@@ -26,11 +25,9 @@
 
 ```shell
 docker info --format '{{.OSType}}'
-docker info --format '{{json .SecurityOptions}}'
 ```
 
-Η πρώτη εντολή πρέπει να δείξει `linux`. Αν η δεύτερη περιλαμβάνει `apparmor`,
-ακολούθησε πρώτα την ενότητα AppArmor.
+Η εντολή πρέπει να δείξει `linux`.
 
 ```shell
 docker compose run --rm --build init
@@ -172,23 +169,10 @@ Proxy σε άλλο μηχάνημα: βάλε στο `.env` το συγκεκρ
 30 λεπτών για μεγάλα turns. Το suite χρησιμοποιεί όριο 30 λεπτών ανά turn,
 ρυθμιζόμενο στο Compose. Χρειάζεται HTTP/SSE, όχι WebSocket forwarding.
 
-## Linux hosts με AppArmor
+## Sandbox
 
 Το seccomp JSON διαβάζεται από το Compose απευθείας από το πακέτο. Δεν χρειάζεται
 αντιγραφή του seccomp μέσα στη VM του Docker Desktop.
-Το AppArmor, όταν υπάρχει, είναι host policy και πρέπει να εγκατασταθεί στον
-Linux host του Docker daemon:
-
-```shell
-sh broker/scripts/install-host-security-profiles.sh --dry-run
-sudo sh broker/scripts/install-host-security-profiles.sh
-sudo sh broker/scripts/install-host-security-profiles.sh --check
-docker compose -f compose.yaml -f compose.apparmor.yaml up -d --build --wait codex-broker
-```
-
-Χρησιμοποίησε και τα δύο `-f` σε επόμενα `up`/recreate στον ίδιο host.
-Η εγκατάσταση του profile απαιτεί τα εργαλεία AppArmor της διανομής όταν είναι ενεργό.
-Σε Docker Desktop που δεν αναφέρει AppArmor, χρησιμοποίησε μόνο το βασικό Compose.
 Το suite δεν απενεργοποιεί το sandbox για να παρακάμψει αποτυχημένο preflight.
 
 ## Διαχείριση και backup
@@ -255,8 +239,9 @@ wsl --install --no-distribution
 Τα line endings κανονικοποιήθηκαν σε LF για Linux. Το root Dockerfile προσθέτει
 Git/ripgrep/Node.js/npm και τα scripts του suite, και εγκαθιστά μαζί τα
 `codex` / `codex-code-mode-host` στο `/usr/local/bin` ώστε να λειτουργούν τα tools.
-Το source του broker δεν άλλαξε
-λογική. Ο κώδικας του upstream είχε ανακτηθεί στις 2026-09-14.
+Η λογική Python του broker διατηρήθηκε. Οι οδηγίες Docker προσαρμόστηκαν στο suite
+και περιλαμβάνονται μόνο τα αρχεία ανάπτυξης που χρησιμοποιεί.
+Ο κώδικας του upstream είχε ανακτηθεί στις 2026-09-14.
 Το βασικό Python image και τα πακέτα του OS επιλύονται στο build· δεν πρόκειται
 για byte-for-byte αναπαραγώγιμο image.
 

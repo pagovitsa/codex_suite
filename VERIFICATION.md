@@ -11,14 +11,12 @@
 | Έλεγχος | Αποτέλεσμα |
 | --- | --- |
 | Βασικό Compose με όλα τα tool profiles | `config --quiet`: PASS, exit 0 |
-| Compose μαζί με AppArmor overlay | `config --quiet`: PASS, exit 0· διατηρεί και τα τρία security options |
 | `python test_suite.py` | 5/5 PASS: idempotent init, key/profile bindings, απόρριψη invalid key, διατήρηση τροποποιημένων bindings, redirects, LF entrypoint |
 | Upstream `test_openai_compat` πάνω στο vendored source | 26/26 PASS, exit 0 |
 | Client σε πραγματικό broker HTTP με fake Codex subprocess | PASS: readiness/auth boundaries, models, sync response, SSE, auth status, task continuation και turn lookup |
 | Upstream `test_config_profiles` | 21/22 PASS· μία αποτυχία POSIX file mode σε Windows |
 | Επιπλέον sandbox contract / απόρριψη overrides και εκτός-workspace cwd | 2/2 PASS, exit 0 |
 | Πέντε επιλεγμένοι native broker έλεγχοι | 3 PASS, 2 ERROR σε Windows teardown |
-| AppArmor installer shell syntax | `bash -n`: PASS, exit 0 |
 | Codex release assets | Υπάρχουν τα amd64/arm64 musl archives στο επίσημο `0.153.4` checksum manifest |
 | Container build / init | PASS σε Docker Desktop Linux amd64, Codex CLI `0.153.4`, checksum verified |
 | Εκκίνηση / πραγματικό sandbox canary | PASS: container Healthy, `/readyz` ready, bubblewrap healthy, `broker-workspace-write` |
@@ -54,7 +52,7 @@ broker HTTP, authentication, συμβατότητα, αποθήκευση και
 Το αρχικό upstream Dockerfile αντέγραφε στο runtime path μόνο το `codex`, ενώ
 το pinned release περιέχει και το sibling executable `codex-code-mode-host`.
 Το root Dockerfile του suite πλέον αντιγράφει και τα δύο μαζί και ελέγχει ότι
-ο helper είναι executable. Το vendored upstream παραμένει αμετάβλητο.
+ο helper είναι executable. Η λογική Python του vendored broker διατηρείται.
 
 Με νέο build και recreate, η ίδια συνεδρία συνεχίστηκε επιτυχώς:
 το πραγματικό μοντέλο δημιούργησε `workspace/hello.py` και εκτέλεσε `python hello.py`.
@@ -84,7 +82,7 @@ restart στις `2026-09-14T12:38:10Z` ήταν Healthy (~0,92s).
 το Desktop σταμάτησε με `desktop stop --force`, και οι φάκελοι μετακινήθηκαν
 σε γειτονικά backups πριν αναδημιουργηθούν. Δεν έγινε factory reset.
 Το Desktop κατόπιν δημιούργησε το `docker-desktop` WSL περιβάλλον και ο engine
-απάντησε με Docker `29.7.2`, OS `linux`, seccomp/cgroupns, χωρίς AppArmor.
+απάντησε με Docker `29.7.2`, OS `linux`, seccomp/cgroupns.
 
 Το πραγματικό `compose -p codex-suite-demo run --rm --build init` ολοκληρώθηκε
 με exit 0 και διατήρησε τα ήδη δημιουργημένα τοπικά κλειδιά.
@@ -95,12 +93,19 @@ restart στις `2026-09-14T12:38:10Z` ήταν Healthy (~0,92s).
 
 ## Όρια των ελέγχων
 
-Δεν δοκιμάστηκαν ξεχωριστός Linux host με AppArmor, arm64, API-key authentication
+Δεν δοκιμάστηκαν ξεχωριστός Linux host, arm64, API-key authentication
 ή το εξωτερικό HTTPS proxy του χρήστη. Το live HTTP chat δοκιμάστηκε μέσω
 `/v1/responses`· το `/v1/chat/completions` καλύφθηκε από τα upstream fake-Codex tests.
 Το live native interrupt δεν επαναδοκιμάστηκε με μοντέλο· καλύφθηκε από τα
 στοχευμένα upstream tests. Οι παλιές αποτυχίες Windows tests παραμένουν παραπάνω.
 Η υπηρεσία απαιτεί επιτυχημένο πραγματικό sandbox preflight πριν ξεκινήσει.
+
+## Επανέλεγχος — 2026-09-15
+
+Μετά την αφαίρεση του προαιρετικού host profile, του overlay και του installer,
+πέρασαν ξανά τα 5 tests του suite, το `docker compose --profile tools config --quiet`
+και το `python client.py check` στο τρέχον demo. Το container παραμένει Healthy.
+Δεν χρειάστηκε νέο build ή restart, καθώς το βασικό Compose και το runtime δεν άλλαξαν.
 
 ## Source review
 

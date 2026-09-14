@@ -422,90 +422,22 @@ CODEX_BROKER_SHUTDOWN_DRAIN_TIMEOUT_SECONDS=30
 
 ## Docker
 
-The Docker image installs the official Codex CLI Linux release archive from `openai/codex` at build time. It runs as the non-root `broker` user and includes a `/readyz` healthcheck.
+The Docker instructions in this vendored copy are adapted for Codex Suite.
+Follow the [suite README](../README.md) and use the [root Compose file](../compose.yaml).
+Run these commands from the suite root:
 
 ```bash
-docker build -t codex-broker .
+docker compose run --rm --build init
+docker compose up -d --build --wait --wait-timeout 180 codex-broker
+docker compose run --rm client check
 ```
 
-First install the host security profiles using the
-[deployment guide](fern/docs/pages/operations/deployment.mdx#managed-sandbox-requirements).
-Run the installer on the Linux Docker daemon host. Hosts without AppArmor
-still need seccomp and should omit only the AppArmor option below.
-
-```bash
-docker run --rm \
-  -p 127.0.0.1:3400:3400 \
-  --read-only \
-  --tmpfs /tmp \
-  --security-opt no-new-privileges:true \
-  --security-opt seccomp=/etc/codex-broker/security/v1/seccomp.json \
-  --security-opt apparmor=codex-broker-bwrap \
-  -v codex-broker-data:/data \
-  -v /path/to/workspaces:/workspaces:rw \
-  -v /path/to/bundles:/bundles:ro \
-  -e CODEX_BROKER_INTERNAL_KEY=dev-only-key \
-  codex-broker
-```
-
-Override the pinned Codex version with `--build-arg CODEX_VERSION=<version>`.
-
-Managed sandbox deployments need the shipped
-[`examples/seccomp/codex-broker.json`](examples/seccomp/codex-broker.json)
-profile. Docker selects seccomp and AppArmor policies before the image starts,
-so install them on the host—not inside the image or only in a deployment
-checkout. The installer is idempotent: its check path makes no host changes;
-the `sudo` invocation installs root-owned, persistent policy files.
-
-```bash
-./scripts/install-host-security-profiles.sh --dry-run
-sudo ./scripts/install-host-security-profiles.sh
-sudo ./scripts/install-host-security-profiles.sh --check
-```
-
-Run the installer on the Linux Docker host. When Docker Desktop is controlled
-from macOS or Windows, its Linux VM—not the client machine—must contain the
-profiles.
-
-The example Compose service always uses the stable seccomp path and
-`no-new-privileges:true`. On an AppArmor-enabled host, include its overlay;
-otherwise use the base file only:
-
-```bash
-docker compose \
-  -f examples/docker-compose.yml \
-  -f examples/docker-compose.apparmor.yml \
-  -f examples/docker-compose.local.yml \
-  up -d
-```
-
-The installer puts the seccomp file at
-`/etc/codex-broker/security/v1/seccomp.json` and, when AppArmor is enabled,
-the named profile at `/etc/apparmor.d/codex-broker-bwrap`. Re-run the check after
-a reboot and before recreating the service. If a Compose file names an AppArmor
-profile that the kernel has not loaded, Docker rejects the container rather
-than silently weakening it.
-The loaded-profile portion of `--check` may require `sudo` even when the
-installed policy files themselves are world-readable.
-
-The checked-in policies record their exact current Moby baseline and checksum.
-The seccomp policy blocks direct `AF_ALG` and `AF_VSOCK` sockets and returns
-`ENOSYS` for the legacy `socketcall` multiplexer, whose pointed-to address
-family seccomp cannot inspect. The broker image supports only 64-bit amd64 and
-arm64 userlands, so that deliberate compatibility-syscall denial does not
-affect a supported image architecture. AppArmor independently denies `AF_ALG`.
-The only other deviations from Moby's default are Bubblewrap's required mount,
-pivot-root, user namespace clone, specific unshare, and detached unmount
-operations. CI validates this metadata and runs the no-model sandbox canary
-before image publication.
-
-Do not replace the policies with `seccomp=unconfined`, `apparmor=unconfined`,
-privileged mode, or `CAP_SYS_ADMIN`; those remove the outer-container
-protection that makes the managed sandbox meaningful.
-
-See the Fern [deployment guide](fern/docs/pages/operations/deployment.mdx) and
-[examples/docker-compose.yml](examples/docker-compose.yml) for a Docker Compose
-example.
+The image installs the official Codex CLI Linux release archive from `openai/codex`,
+runs as the non-root `broker` user, and includes a `/readyz` healthcheck.
+Compose loads the shipped [seccomp policy](examples/seccomp/codex-broker.json)
+directly from the checkout.
+The host must support the Linux user namespaces required by Bubblewrap;
+the suite requires a successful sandbox preflight before accepting work.
 
 ## Current Integrations
 

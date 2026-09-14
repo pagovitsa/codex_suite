@@ -1,4 +1,0 @@
-services:
-  codex-broker:
-    security_opt:
-      - apparmor=codex-broker-bwrap
